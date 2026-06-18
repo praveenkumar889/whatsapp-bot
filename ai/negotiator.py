@@ -909,72 +909,74 @@ async def handle_negotiation(
 
         if counter_price is not None:
             rounds += 1
-            is_final = rounds >= MAX_NEGOTIATION_ROUNDS
+            is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
+            last_offer = negotiation_state.get("last_offer_price", price_num)
 
             if counter_price < floor_price:
-                # Below floor — offer floor price
-                reply = await _reply_below_floor(
-                    sender, product_name, counter_price,
-                    floor_price, quantity, biz_name
-                )
-                new_offer = floor_price
+                if is_final:
+                    # Rounds exhausted AND below floor — now reveal minimum firmly.
+                    # Floor is only shown after full negotiation, never on first ask.
+                    floor_total = round(floor_price * quantity, 2)
+                    try:
+                        firm_resp = _client.chat.completions.create(
+                            model       = AZURE_OPENAI_DEPLOYMENT,
+                            max_tokens  = 150,
+                            temperature = 0.3,
+                            messages    = [
+                                {"role": "system", "content": (
+                                    f"You are a sales negotiator for {biz_name}.\n"
+                                    f"After {rounds} rounds of negotiation, customer proposed Rs.{counter_price:,.0f} which is below our minimum.\n"
+                                    f"Our absolute minimum is Rs.{floor_price:,.0f}/unit "
+                                    f"(Total Rs.{floor_total:,.0f} for {quantity} units of {product_name}).\n"
+                                    "Firmly but politely tell the customer this is the lowest we can go.\n"
+                                    "We cannot provide a lower price under any circumstances.\n"
+                                    "Do NOT mention escalation or sales team.\n"
+                                    "Give them two clear options: accept the floor price or decline.\n"
+                                    f"Address as {sender}. Max 3 lines. Use *bold* for prices."
+                                )},
+                                {"role": "user", "content": "Give the firm final response."},
+                            ],
+                        )
+                        reply = firm_resp.choices[0].message.content.strip()
+                    except Exception:
+                        reply = (
+                            f"{sender}, we truly cannot go below *Rs.{floor_price:,.0f}/unit*. 🙏\n\n"
+                            f"That's our absolute best price for {quantity} units of *{product_name}* "
+                            f"(Total: *Rs.{floor_total:,.0f}*).\n\n"
+                            f"Would you like to proceed at *Rs.{floor_price:,.0f}/unit*?"
+                        )
+                    return {
+                        "reply":        reply,
+                        "state":        _updated_state(
+                            quantity          = quantity,
+                            rounds            = 1,
+                            last_offer_price  = floor_price,
+                            awaiting_quantity = False,
+                        ),
+                        "order_ready":  False,
+                        "escalate":     False,
+                        "agreed_price": None,
+                        "quantity":     quantity,
+                    }
+                else:
+                    # Below floor but rounds NOT exhausted — keep negotiating.
+                    # Move midway between last_offer and floor WITHOUT revealing floor.
+                    new_offer = max(round((last_offer + floor_price) / 2, 2), floor_price)
+                    total     = round(new_offer * quantity, 2)
+                    print(f"[NEGOTIATOR] Below floor, rounds={rounds}/{MAX_NEGOTIATION_ROUNDS} — countering Rs.{new_offer} (floor Rs.{floor_price} not revealed yet)")
+                    reply = await _reply_counter_offer(
+                        sender, product_name, counter_price, new_offer,
+                        quantity, total, rounds, False, biz_name
+                    )
             else:
-                # Above floor — meet midway
-                last_offer = negotiation_state.get("last_offer_price", price_num)
-                midway     = round((last_offer + counter_price) / 2, 2)
-                new_offer  = max(midway, floor_price)
-                total      = round(new_offer * quantity, 2)
-                reply      = await _reply_counter_offer(
+                # Above floor — meet midway between last_offer and customer price
+                midway    = round((last_offer + counter_price) / 2, 2)
+                new_offer = max(midway, floor_price)
+                total     = round(new_offer * quantity, 2)
+                reply     = await _reply_counter_offer(
                     sender, product_name, counter_price, new_offer,
                     quantity, total, rounds, is_final, biz_name
                 )
-
-            if is_final and counter_price < floor_price:
-                # Max rounds + below floor — firmly state we cannot go lower.
-                # Do NOT escalate to human — let customer decide to accept or walk away.
-                # Reset rounds so customer can keep trying if they want.
-                floor_total = round(floor_price * quantity, 2)
-                try:
-                    firm_resp = _client.chat.completions.create(
-                        model       = AZURE_OPENAI_DEPLOYMENT,
-                        max_tokens  = 150,
-                        temperature = 0.3,
-                        messages    = [
-                            {"role": "system", "content": (
-                                f"You are a sales negotiator for {biz_name}.\n"
-                                f"Customer proposed Rs.{counter_price:,.0f} — below our minimum.\n"
-                                f"Our absolute minimum is Rs.{floor_price:,.0f}/unit "
-                                f"(Total Rs.{floor_total:,.0f} for {quantity} units of {product_name}).\n"
-                                "Firmly but politely tell the customer this is the lowest we can go.\n"
-                                "We cannot provide a lower price under any circumstances.\n"
-                                "Do NOT mention escalation or sales team.\n"
-                                "Give them two clear options: accept the floor price or decline.\n"
-                                f"Address as {sender}. Max 3 lines. Use *bold* for prices."
-                            )},
-                            {"role": "user", "content": "Give the firm final response."},
-                        ],
-                    )
-                    reply = firm_resp.choices[0].message.content.strip()
-                except Exception:
-                    reply = (
-                        f"{sender}, we truly cannot go below *Rs.{floor_price:,.0f}/unit*. 🙏\n\n"
-                        f"That's our absolute best price for {quantity} units of *{product_name}* "
-                        f"(Total: *Rs.{floor_total:,.0f}*).\n\n"
-                        f"Would you like to proceed at *Rs.{floor_price:,.0f}/unit*?"
-                    )
-                return {
-                    "reply":        reply,
-                    "state":        _updated_state(
-                        quantity          = quantity,
-                        rounds            = 1,  # reset so customer can respond
-                        last_offer_price  = floor_price,
-                        awaiting_quantity = False,
-                    ),
-                    "order_ready":  False,
-                    "escalate":     False,
-                    "agreed_price": None,
-                    "quantity":     quantity,
-                }
 
             return {
                 "reply":        reply,
