@@ -931,6 +931,44 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             print(f"[NEGOTIATOR] New search — clearing stale negotiation state")
             await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
             neg_state = None
+        elif neg_state.get("product_name"):
+            # Clear stale state if customer is now talking about a DIFFERENT product
+            saved_product = (neg_state.get("product_name") or "").lower().strip()
+            current_products = [
+                (p.get("product_name") or p.get("name") or "").lower().strip()
+                for p in selection
+            ]
+            # Check if saved negotiation product matches any product in current selection
+            product_still_active = any(
+                saved_product[:10] in cp or cp[:10] in saved_product
+                for cp in current_products
+                if cp
+            )
+            if current_products and not product_still_active:
+                # LLM double-check: is this message about a NEW product?
+                try:
+                    prod_check = _ai_client.chat.completions.create(
+                        model       = AZURE_OPENAI_DEPLOYMENT,
+                        max_tokens  = 5,
+                        temperature = 0,
+                        messages    = [
+                            {"role": "system", "content": (
+                                f"Customer was negotiating: '{saved_product}'.\n"
+                                f"Current products shown: {', '.join(current_products[:3])}.\n"
+                                "Is the customer now asking about a DIFFERENT product?\n"
+                                "Reply ONLY 'YES' or 'NO'."
+                            )},
+                            {"role": "user", "content": incoming.text},
+                        ],
+                    )
+                    is_new_product = "YES" in prod_check.choices[0].message.content.strip().upper()
+                except Exception:
+                    is_new_product = False
+
+                if is_new_product:
+                    print(f"[NEGOTIATOR] Product changed from '{saved_product}' — clearing stale negotiation state")
+                    await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
+                    neg_state = None
 
     if neg_state or await is_negotiation_request(incoming.text, session_history):
         # Resolve which product is being negotiated — priority order:
@@ -996,6 +1034,17 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     )
 
                     if result["order_ready"] and result["agreed_price"]:
+                        # Guard: if already awaiting confirmation, don't show summary again
+                        # This prevents duplicate order summaries when customer keeps negotiating
+                        already_awaiting = neg_state and neg_state.get("awaiting_invoice_confirmation", False)
+                        if already_awaiting:
+                            old_agreed = float(neg_state.get("last_offer_price", 0))
+                            new_agreed = float(result["agreed_price"])
+                            # Only re-show if price actually changed
+                            if abs(old_agreed - new_agreed) < 1.0:
+                                print(f"[NEGOTIATOR] Already awaiting confirmation at Rs.{old_agreed} — skipping duplicate summary")
+                                return f"You've already confirmed Rs.{old_agreed:,.0f}/unit, {incoming.sender_name}. Please reply *Confirm* to place your order! 🎉"
+
                         # Do NOT create order yet — show summary first and wait for Confirm
                         agreed  = result["agreed_price"]
                         qty     = result["quantity"]
@@ -1283,7 +1332,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             # Also send text with the installation link
             link_text = (
                 f"Here is the installation guide for *{cached_product.get('product_name') or product_name}*:\n\n"
-                f"?? {inst_url}\n\n"
+                f"🔗 {inst_url}\n\n"
                 f"To order, just tell me how many units you'd like!"
             )
             link_wamid = await send_whatsapp_reply(incoming.session_id, link_text)

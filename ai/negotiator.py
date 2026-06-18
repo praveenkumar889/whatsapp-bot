@@ -277,8 +277,11 @@ async def detect_acceptance(
     session_history: list = None,
 ) -> bool:
     """
-    Detects if customer is accepting the current offer.
-    Examples: "OK", "Deal", "Sounds good", "Proceed", "Yes", "I'll take it"
+    Detects if customer is PURELY accepting the current offer with no new price.
+    Examples: "OK", "Deal", "Sounds good", "Proceed", "Yes", "I'll take it", "We go for 1840"
+
+    CRITICAL: "Can we go for 1800?" is a COUNTER-OFFER — must return False.
+    Only return True when customer is agreeing/confirming, NOT when proposing a new price.
     """
     try:
         response = _client.chat.completions.create(
@@ -287,7 +290,16 @@ async def detect_acceptance(
             temperature = 0,
             messages    = [
                 {"role": "system", "content": (
-                    "Is the customer accepting, agreeing to, or confirming the price offer?\n"
+                    "Is the customer ACCEPTING or AGREEING to the current price offer?\n"
+                    "\n"
+                    "Answer YES only for clear acceptance/agreement:\n"
+                    "  YES: 'OK', 'Deal', 'Proceed', 'Yes', 'I accept', 'Let\'s go', 'We go for [price]', 'That works'\n"
+                    "\n"
+                    "Answer NO for counter-offers or questions:\n"
+                    "  NO: 'Can we go for 1800?', 'How about 1700?', 'Can you do 600?', 'What about 1500?'\n"
+                    "  NO: Any message asking IF a price is possible (contains 'can', 'could', 'would', 'any chance')\n"
+                    "  NO: Any message with a question mark proposing a new price\n"
+                    "\n"
                     "Reply ONLY with 'YES' or 'NO'."
                 )},
                 {"role": "user", "content": message},
