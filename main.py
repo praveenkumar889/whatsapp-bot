@@ -1240,33 +1240,69 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     # ── Send image only if explicitly requested ───────────────────────────
     if asks_for_image:
-        # Check if customer is asking for installation image specifically
-        msg_lower = incoming.text.lower()
-        wants_installation = any(w in msg_lower for w in ["install", "setup", "fit", "mount", "how to"])
+        # Use LLM to decide: is this an installation/steps request or a product image request?
+        # Zero hardcoding — LLM reads the actual message and decides.
+        try:
+            img_intent_resp = _ai_client.chat.completions.create(
+                model       = AZURE_OPENAI_DEPLOYMENT,
+                max_tokens  = 5,
+                temperature = 0,
+                messages    = [
+                    {"role": "system", "content": (
+                        "Classify this customer message into one of two types:\n"
+                        "INSTALLATION — customer is asking for installation steps, how to install, "
+                        "fitting guide, setup instructions, mounting guide, or how to fit/assemble the product.\n"
+                        "PRODUCT_IMAGE — customer is asking to see the product image, photo, picture, or visual.\n"
+                        "Reply ONLY with one word: INSTALLATION or PRODUCT_IMAGE"
+                    )},
+                    {"role": "user", "content": incoming.text},
+                ],
+            )
+            img_intent = img_intent_resp.choices[0].message.content.strip().upper()
+        except Exception:
+            img_intent = "PRODUCT_IMAGE"
+        print(f"[FOLLOW-UP] Image intent: {img_intent}")
 
-        if wants_installation:
-            inst_url = cached_product.get("installation_url") or matched_product.get("installation_url")
-            if inst_url:
-                caption = f"Installation guide — {cached_product.get('product_name') or product_name}"
-                inst_wamid = await send_whatsapp_image(incoming.session_id, inst_url, caption)
-                if inst_wamid:
-                    print(f"[FOLLOW-UP] Installation image sent for '{product_name}' — wamid={inst_wamid}")
-                    await save_outbound_message(
-                        tenant_id     = incoming.tenant_id,
-                        session_id    = incoming.session_id,
-                        message_id    = inst_wamid,
-                        text          = caption,
-                        media_url     = inst_url,
-                        original_type = "image",
-                    )
+        inst_url = (cached_product.get("installation_url") or matched_product.get("installation_url") or "").replace("http://", "https://")
+        img_url  = (cached_product.get("image_url") or matched_product.get("image_url") or "").replace("http://", "https://")
 
-        img_url = cached_product.get("image_url") or matched_product.get("image_url")
-        if img_url:
+        if "INSTALLATION" in img_intent and inst_url:
+            # Send installation image
+            caption = f"Installation guide — {cached_product.get('product_name') or product_name}"
+            inst_wamid = await send_whatsapp_image(incoming.session_id, inst_url, caption)
+            if inst_wamid:
+                print(f"[FOLLOW-UP] Installation image sent for '{product_name}' — wamid={inst_wamid}")
+                await save_outbound_message(
+                    tenant_id     = incoming.tenant_id,
+                    session_id    = incoming.session_id,
+                    message_id    = inst_wamid,
+                    text          = caption,
+                    media_url     = inst_url,
+                    original_type = "image",
+                )
+            # Also send text with the installation link
+            link_text = (
+                f"Here is the installation guide for *{cached_product.get('product_name') or product_name}*:\n\n"
+                f"?? {inst_url}\n\n"
+                f"To order, just tell me how many units you'd like!"
+            )
+            link_wamid = await send_whatsapp_reply(incoming.session_id, link_text)
+            if link_wamid:
+                await save_outbound_message(
+                    tenant_id  = incoming.tenant_id,
+                    session_id = incoming.session_id,
+                    message_id = link_wamid,
+                    text       = link_text,
+                )
+            return None  # Skip LLM reply — already sent image + link
+
+        elif img_url:
+            # Product image only
             price   = float(cached_product.get("list_price") or matched_product.get("list_price", 0) or 0)
             caption = f"{cached_product.get('product_name') or product_name}\nRs.{price:,.0f}"
             img_wamid = await send_whatsapp_image(incoming.session_id, img_url, caption)
             if img_wamid:
-                print(f"[FOLLOW-UP] Image sent for '{product_name}' (user asked) — wamid={img_wamid}")
+                print(f"[FOLLOW-UP] Product image sent for '{product_name}' — wamid={img_wamid}")
                 await save_outbound_message(
                     tenant_id     = incoming.tenant_id,
                     session_id    = incoming.session_id,
@@ -1348,11 +1384,22 @@ INTENT B — PRODUCT QUESTION:
   → Be concise, max 8 lines.
   → End with: "To order, just tell me how many units you'd like!"
 
+INTENT C — INSTALLATION QUESTION:
+  Customer asks about installation, setup, fitting, mounting, or how to install.
+  → The installation image and link are already sent separately by the system before this reply.
+  → Say: "I've sent you the installation guide image and link above! ??"
+  → Then briefly describe any installation tips from feature_descriptions if available.
+  → End with: "To order, just tell me how many units you'd like!" End with: "To order, just tell me how many units you'd like!"
+
 RULES:
 - Address the customer as {incoming.sender_name}
 - NEVER ask "which product?" — the product is already known from context
 - Use WhatsApp formatting (• bullets, *bold* for key info)
 - If answer not in product data: "I don't have that info, please contact our team"
+- NEVER include raw URLs or markdown links like [text](url) in your reply — images are sent separately by the system
+- NEVER mention installation_url, image_url or any URL from product data in your text reply
+- For warranty questions: read from the "warranty" field and state it clearly in plain text
+- For installation questions: just say the image was sent above, do not paste the URL
 
 PRODUCT DATA:
 {json.dumps(product_context, indent=2)}

@@ -789,19 +789,31 @@ async def handle_negotiation(
                     "quantity":     None,
                 }
 
-    # ── Step 3: We have quantity — check acceptance first ─────────────────────
+    # ── Step 3: We have quantity — check acceptance first ─────────────────
     if rounds > 0 and await detect_acceptance(msg, session_history):
         last_offer = negotiation_state.get("last_offer_price", price_num)
-        total      = round(last_offer * quantity, 2)
-        reply      = await _reply_acceptance(
-            sender, product_name, last_offer, quantity, total, biz_name
+
+        # KEY FIX: If customer stated a SPECIFIC price in their acceptance message
+        # (e.g. "We go for 1870 that's the final price"), use THEIR price --
+        # not our last_offer_price. Only honour it if their price >= floor.
+        customer_stated_price = await detect_counter_offer(msg, session_history)
+        if customer_stated_price is not None and customer_stated_price >= floor_price:
+            agreed_price = customer_stated_price
+            print(f"[NEGOTIATOR] Customer stated price Rs.{customer_stated_price} >= floor Rs.{floor_price} -- using customer price")
+        else:
+            agreed_price = last_offer
+            print(f"[NEGOTIATOR] No valid customer price stated -- using last_offer Rs.{last_offer}")
+
+        total = round(agreed_price * quantity, 2)
+        reply = await _reply_acceptance(
+            sender, product_name, agreed_price, quantity, total, biz_name
         )
         return {
             "reply":        reply,
-            "state":        _updated_state(quantity=quantity, rounds=rounds),
+            "state":        _updated_state(quantity=quantity, rounds=rounds, last_offer_price=agreed_price),
             "order_ready":  True,
             "escalate":     False,
-            "agreed_price": last_offer,
+            "agreed_price": agreed_price,
             "quantity":     quantity,
         }
 
