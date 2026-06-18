@@ -570,22 +570,25 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                     sku = p.get("sku")
                     if sku:
                         cached_item = [{
-                            "product_name":         p.get("name"),
-                            "list_price":           float(p.get("price_num", 0)),
-                            "floor_price":          float(p.get("price_num", 0)) * 0.85,
-                            "sku":                  sku,
-                            "image_url":            p.get("image_url"),
-                            "product_url":          p.get("url"),
-                            "discount_pct":         p.get("discount_percentage", 0),
-                            "regular_price":        p.get("regular_price", p.get("price_num", 0)),
-                            "features":             [],
-                            "specs":                [],
-                            "review_count":         p.get("review_count", 0),
-                            "rating":               p.get("rating", 0),
-                            "policies":             [],
-                            "faqs":                 [],
-                            "warranties":           [],
-                            "feature_descriptions": p.get("feature_descriptions", ""),
+                            "product_name":               p.get("name"),
+                            "list_price":                 float(p.get("price_num", 0)),
+                            "floor_price":                float(p.get("price_num", 0)) * 0.85,
+                            "sku":                        sku,
+                            "image_url":                  p.get("image_url"),
+                            "installation_url":           p.get("installation_url"),
+                            "product_url":                p.get("url"),
+                            "discount_pct":               p.get("discount_percentage", 0),
+                            "regular_price":              p.get("regular_price", p.get("price_num", 0)),
+                            "features":                   [],
+                            "specs":                      [],
+                            "review_count":               p.get("review_count", 0),
+                            "rating":                     p.get("rating", 0),
+                            "policies":                   [],
+                            "faqs":                       [],
+                            "warranties":                 [],
+                            "warranty":                   p.get("warranty", ""),
+                            "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
+                            "feature_descriptions":       p.get("feature_descriptions", ""),
                         }]
                         await save_product_api_response(incoming.tenant_id, sku, cached_item)
                 print(f"[GRAPHRAG] Saved {len(products)} products to product_cache DB")
@@ -1237,6 +1240,26 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     # ── Send image only if explicitly requested ───────────────────────────
     if asks_for_image:
+        # Check if customer is asking for installation image specifically
+        msg_lower = incoming.text.lower()
+        wants_installation = any(w in msg_lower for w in ["install", "setup", "fit", "mount", "how to"])
+
+        if wants_installation:
+            inst_url = cached_product.get("installation_url") or matched_product.get("installation_url")
+            if inst_url:
+                caption = f"Installation guide — {cached_product.get('product_name') or product_name}"
+                inst_wamid = await send_whatsapp_image(incoming.session_id, inst_url, caption)
+                if inst_wamid:
+                    print(f"[FOLLOW-UP] Installation image sent for '{product_name}' — wamid={inst_wamid}")
+                    await save_outbound_message(
+                        tenant_id     = incoming.tenant_id,
+                        session_id    = incoming.session_id,
+                        message_id    = inst_wamid,
+                        text          = caption,
+                        media_url     = inst_url,
+                        original_type = "image",
+                    )
+
         img_url = cached_product.get("image_url") or matched_product.get("image_url")
         if img_url:
             price   = float(cached_product.get("list_price") or matched_product.get("list_price", 0) or 0)
@@ -1254,19 +1277,22 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
 
     product_context = {
-        "name":                 cached_product.get("product_name"),
-        "sku":                  cached_product.get("sku"),
-        "price":                f"Rs.{float(cached_product.get('list_price') or 0):,.0f}",
-        "list_price_num":       float(cached_product.get("list_price") or 0),
-        "regular_price":        f"Rs.{float(cached_product.get('regular_price') or 0):,.0f}",
-        "discount":             f"{cached_product.get('discount_pct', 0)}% off",
-        "rating":               cached_product.get("rating", 0),
-        "review_count":         cached_product.get("review_count", 0),
-        "features":             cached_product.get("features", []),
-        "feature_descriptions": cached_product.get("feature_descriptions", ""),
-        "specs":                cached_product.get("specs", []),
-        "warranties":           cached_product.get("warranties", []),
-        "delivery_policy":      [
+        "name":                       cached_product.get("product_name"),
+        "sku":                        cached_product.get("sku"),
+        "price":                      f"Rs.{float(cached_product.get('list_price') or 0):,.0f}",
+        "list_price_num":             float(cached_product.get("list_price") or 0),
+        "regular_price":              f"Rs.{float(cached_product.get('regular_price') or 0):,.0f}",
+        "discount":                   f"{cached_product.get('discount_pct', 0)}% off",
+        "rating":                     cached_product.get("rating", 0),
+        "review_count":               cached_product.get("review_count", 0),
+        "features":                   cached_product.get("features", []),
+        "feature_descriptions":       cached_product.get("feature_descriptions", ""),
+        "specs":                      cached_product.get("specs", []),
+        "warranties":                 cached_product.get("warranties", []),
+        "warranty":                   cached_product.get("warranty", ""),
+        "replacement_exchange_policy": cached_product.get("replacement_exchange_policy", ""),
+        "installation_url":           cached_product.get("installation_url", ""),
+        "delivery_policy":            [
             pol.get("content", "") for pol in cached_product.get("policies", [])
         ],
         "faqs": [
