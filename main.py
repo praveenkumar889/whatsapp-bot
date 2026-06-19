@@ -694,6 +694,20 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
             return summary_text
 
         # ── Plain text / string response ───────────────────────────────────
+        # CRITICAL: response_text can be an empty list [] when GraphRAG finds
+        # zero matching products. An empty list is falsy in Python, so the old
+        # `if response_text else str(data)` fallback incorrectly stringified
+        # the ENTIRE raw API payload (status, tenant_id, message_id, etc.) and
+        # sent that directly to the customer as a WhatsApp message. Fixed:
+        # explicitly check for the empty-list case and reply with a clean,
+        # friendly message instead of ever exposing raw API internals.
+        if isinstance(response_text, list) and len(response_text) == 0:
+            print(f"[GRAPHRAG] Empty product list — no matches found")
+            return (
+                f"Sorry {incoming.sender_name}, I couldn't find any products matching that. "
+                f"Could you try describing it differently, or browse all products at inventaa.in? 💡"
+            )
+
         reply_str = str(response_text).strip() if response_text else str(data)
         print(f"[GRAPHRAG] Plain text reply — {len(reply_str)} chars")
 
