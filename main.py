@@ -438,6 +438,140 @@ async def process_message(data: dict):
 # GRAPHRAG HANDLER — all product queries route here
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _send_structured_product_list(incoming, products: list) -> str:
+    """
+    Builds and sends the full product-list response: caches products,
+    saves the selection for follow-up picking, sends image cards for the
+    first 3 products, and returns the numbered text summary.
+
+    Extracted so it can be reused both for the initial GraphRAG response
+    AND for a successful retry response — fixes a bug where a successful
+    retry with real products silently fell through to returning the
+    ORIGINAL error text instead of ever rendering the retried products.
+    """
+    print(f"[GRAPHRAG] Got {len(products)} products from structured response")
+
+    if len(products) == 1:
+        try:
+            from db.session_store import save_last_discussed_product
+            pname = products[0].get("name") or products[0].get("product_name")
+            if pname:
+                await save_last_discussed_product(incoming.tenant_id, incoming.session_id, pname)
+        except Exception as e:
+            print(f"[GRAPHRAG] Failed to save single product context: {e}")
+
+    try:
+        _t_cache_save_start = time.monotonic()
+        batch_items = []
+        for p in products:
+            sku = p.get("sku")
+            if sku:
+                cached_item = [{
+                    "product_name":               p.get("name"),
+                    "list_price":                 float(p.get("price_num", 0)),
+                    "floor_price":                float(p.get("price_num", 0)) * 0.85,
+                    "sku":                        sku,
+                    "image_url":                  p.get("image_url"),
+                    "installation_url":           p.get("installation_url"),
+                    "product_url":                p.get("url"),
+                    "discount_pct":               p.get("discount_percentage", 0),
+                    "regular_price":              p.get("regular_price", p.get("price_num", 0)),
+                    "features":                   [],
+                    "specs":                      [],
+                    "review_count":               p.get("review_count", 0),
+                    "rating":                     p.get("rating", 0),
+                    "policies":                   [],
+                    "faqs":                       [],
+                    "warranties":                 [],
+                    "warranty":                   p.get("warranty", ""),
+                    "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
+                    "feature_descriptions":       p.get("feature_descriptions", ""),
+                }]
+                batch_items.append({"sku": sku, "api_response": cached_item})
+
+        from db.session_store import save_product_api_responses_batch
+        await save_product_api_responses_batch(incoming.tenant_id, batch_items)
+        print(f"[TIMING] Product cache batch save ({len(batch_items)} products): {time.monotonic() - _t_cache_save_start:.2f}s")
+    except Exception as e:
+        print(f"[GRAPHRAG] Cache save failed (non-critical): {e}")
+
+    try:
+        await save_graphrag_product_selection(
+            tenant_id  = incoming.tenant_id,
+            session_id = incoming.session_id,
+            products   = products,
+        )
+        print(f"[GRAPHRAG] Product selection saved to workflow_sessions")
+    except Exception as e:
+        print(f"[GRAPHRAG] Selection save failed (non-critical): {e}")
+
+    MAX_IMAGE_PRODUCTS = 3
+    for i, p in enumerate(products, 1):
+        if i > MAX_IMAGE_PRODUCTS:
+            break
+
+        img_url   = p.get("image_url")
+        name      = p.get("name", "Product")
+        price     = p.get("price_num", 0)
+        reg_price = p.get("regular_price", price)
+        discount  = p.get("discount_percentage", 0)
+        rating    = p.get("rating", 0)
+        reviews   = p.get("review_count", 0)
+
+        caption = f"{i}. {name}\nRs.{float(price):,.0f}"
+        if discount:
+            caption += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
+        if rating:
+            caption += f"\n⭐ {rating} ({reviews} reviews)"
+
+        if img_url:
+            img_wamid = await send_whatsapp_image(incoming.session_id, img_url, caption)
+            if img_wamid:
+                print(f"[GRAPHRAG] Image sent for product {i}: {name} — wamid={img_wamid}")
+                await save_outbound_message(
+                    tenant_id     = incoming.tenant_id,
+                    session_id    = incoming.session_id,
+                    message_id    = img_wamid,
+                    text          = caption,
+                    media_url     = img_url,
+                    original_type = "image",
+                )
+        else:
+            reply_wamid = await send_whatsapp_reply(incoming.session_id, caption)
+            if reply_wamid:
+                print(f"[GRAPHRAG] No image for product {i}: {name} — sent text card wamid={reply_wamid}")
+                await save_outbound_message(
+                    tenant_id  = incoming.tenant_id,
+                    session_id = incoming.session_id,
+                    message_id = reply_wamid,
+                    text       = caption,
+                )
+
+    lines = [f"Here are the options for you, {incoming.sender_name}! 💡\n"]
+    for i, p in enumerate(products, 1):
+        name      = p.get("name", "Product")
+        price     = p.get("price_num", 0)
+        reg_price = p.get("regular_price", price)
+        discount  = p.get("discount_percentage", 0)
+        if i <= MAX_IMAGE_PRODUCTS:
+            entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
+            if discount:
+                entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
+            lines.append(entry)
+        else:
+            lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
+
+    lines.append(
+        f"\nReply with the product name to know more or place an order."
+    )
+
+    summary_text = "\n".join(lines)
+    if len(summary_text) > 4096:
+        summary_text = summary_text[:4090] + "\n…"
+
+    return summary_text
+
+
 async def call_graphrag_api(incoming, session_history: list = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
@@ -566,147 +700,39 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         response_text = data.get("response_text", [])
 
+        # ── Clarification request response ──────────────────────────────────
+        # GraphRAG can return a THIRD response shape: a dict with
+        # "status": "needs_clarification" and "available_collections" — this
+        # happens when a query (e.g. "outdoor lights") matches products
+        # spanning multiple distinct collections and GraphRAG wants the
+        # customer to narrow down which one they mean.
+        #
+        # BUG FIXED: previously this dict fell through to str(response_text)
+        # and got sent to the customer VERBATIM as raw Python dict syntax
+        # (e.g. "{'status': 'needs_clarification', 'message': ...}") —
+        # confirmed in production screenshots. Now it's rendered as a
+        # clean, friendly numbered list instead.
+        if isinstance(response_text, dict) and response_text.get("status") == "needs_clarification":
+            collections = response_text.get("available_collections", [])
+            clarify_msg = response_text.get(
+                "message",
+                "Could you let me know which category you're interested in?"
+            )
+            print(f"[GRAPHRAG] Needs clarification — {len(collections)} collections offered")
+
+            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+            if collections:
+                lines.append("")
+                for i, c in enumerate(collections, 1):
+                    lines.append(f"*{i}.* {c}")
+                lines.append("")
+                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+
+            return "\n".join(lines)
+
         # ── Structured product list response ──────────────────────────────
         if isinstance(response_text, list) and response_text and isinstance(response_text[0], dict):
-            products = response_text
-            print(f"[GRAPHRAG] Got {len(products)} products from structured response")
-            
-            # Save single product as last discussed if only 1 is returned
-            if len(products) == 1:
-                try:
-                    from db.session_store import save_last_discussed_product
-                    pname = products[0].get("name") or products[0].get("product_name")
-                    if pname:
-                        await save_last_discussed_product(incoming.tenant_id, incoming.session_id, pname)
-                except Exception as e:
-                    print(f"[GRAPHRAG] Failed to save single product context: {e}")
-
-            # Save each product to product_cache (24hr TTL)
-            # So follow-up questions can fetch product details without calling GraphRAG again
-            # PERFORMANCE: batch all products into ONE Supabase upsert call instead of
-            # one network round-trip per product. A 100-product category search used to
-            # take ~18 seconds just for this save loop (measured in production logs) —
-            # batching brings it down to a single round-trip (~0.3-0.5s regardless of size).
-            try:
-                _t_cache_save_start = time.monotonic()
-                batch_items = []
-                for p in products:
-                    sku = p.get("sku")
-                    if sku:
-                        cached_item = [{
-                            "product_name":               p.get("name"),
-                            "list_price":                 float(p.get("price_num", 0)),
-                            "floor_price":                float(p.get("price_num", 0)) * 0.85,
-                            "sku":                        sku,
-                            "image_url":                  p.get("image_url"),
-                            "installation_url":           p.get("installation_url"),
-                            "product_url":                p.get("url"),
-                            "discount_pct":               p.get("discount_percentage", 0),
-                            "regular_price":              p.get("regular_price", p.get("price_num", 0)),
-                            "features":                   [],
-                            "specs":                      [],
-                            "review_count":               p.get("review_count", 0),
-                            "rating":                     p.get("rating", 0),
-                            "policies":                   [],
-                            "faqs":                       [],
-                            "warranties":                 [],
-                            "warranty":                   p.get("warranty", ""),
-                            "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
-                            "feature_descriptions":       p.get("feature_descriptions", ""),
-                        }]
-                        batch_items.append({"sku": sku, "api_response": cached_item})
-
-                from db.session_store import save_product_api_responses_batch
-                await save_product_api_responses_batch(incoming.tenant_id, batch_items)
-                print(f"[TIMING] Product cache batch save ({len(batch_items)} products): {time.monotonic() - _t_cache_save_start:.2f}s")
-            except Exception as e:
-                print(f"[GRAPHRAG] Cache save failed (non-critical): {e}")
-
-            # Save product list to workflow_sessions PRODUCT_SELECTION (20min TTL)
-            # Customer picks by number ("1") or name ("Reva") in next message
-            try:
-                await save_graphrag_product_selection(
-                    tenant_id  = incoming.tenant_id,
-                    session_id = incoming.session_id,
-                    products   = products,
-                )
-                print(f"[GRAPHRAG] Product selection saved to workflow_sessions")
-            except Exception as e:
-                print(f"[GRAPHRAG] Selection save failed (non-critical): {e}")
-
-            # Send image cards for the FIRST 3 products only.
-            # Products 4+ appear only in the numbered text list below —
-            # this keeps the chat clean while still showcasing top picks visually.
-            MAX_IMAGE_PRODUCTS = 3
-            for i, p in enumerate(products, 1):
-                if i > MAX_IMAGE_PRODUCTS:
-                    break  # remaining products shown in text list only
-
-                img_url   = p.get("image_url")
-                name      = p.get("name", "Product")
-                price     = p.get("price_num", 0)
-                reg_price = p.get("regular_price", price)
-                discount  = p.get("discount_percentage", 0)
-                rating    = p.get("rating", 0)
-                reviews   = p.get("review_count", 0)
-
-                caption = f"{i}. {name}\nRs.{float(price):,.0f}"
-                if discount:
-                    caption += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
-                if rating:
-                    caption += f"\n⭐ {rating} ({reviews} reviews)"
-
-                if img_url:
-                    img_wamid = await send_whatsapp_image(incoming.session_id, img_url, caption)
-                    if img_wamid:
-                        print(f"[GRAPHRAG] Image sent for product {i}: {name} — wamid={img_wamid}")
-                        await save_outbound_message(
-                            tenant_id     = incoming.tenant_id,
-                            session_id    = incoming.session_id,
-                            message_id    = img_wamid,
-                            text          = caption,
-                            media_url     = img_url,
-                            original_type = "image",
-                        )
-                else:
-                    # No image available — send product details as text card
-                    reply_wamid = await send_whatsapp_reply(incoming.session_id, caption)
-                    if reply_wamid:
-                        print(f"[GRAPHRAG] No image for product {i}: {name} — sent text card wamid={reply_wamid}")
-                        await save_outbound_message(
-                            tenant_id  = incoming.tenant_id,
-                            session_id = incoming.session_id,
-                            message_id = reply_wamid,
-                            text       = caption,
-                        )
-
-            # Build numbered text list — first 3 with discount detail, 4+ compact (name + price only)
-            lines = [f"Here are the options for you, {incoming.sender_name}! 💡\n"]
-            for i, p in enumerate(products, 1):
-                name      = p.get("name", "Product")
-                price     = p.get("price_num", 0)
-                reg_price = p.get("regular_price", price)
-                discount  = p.get("discount_percentage", 0)
-                if i <= MAX_IMAGE_PRODUCTS:
-                    # Compact single-line with discount info for showcased products
-                    entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
-                    if discount:
-                        entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
-                    lines.append(entry)
-                else:
-                    # Compact single-line format for products not shown with images
-                    lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
-
-            lines.append(
-                f"\nReply with the product name to know more or place an order."
-            )
-
-            summary_text = "\n".join(lines)
-            # Safety: WhatsApp text.body limit is 4096 chars
-            if len(summary_text) > 4096:
-                summary_text = summary_text[:4090] + "\n…"
-
-            return summary_text
+            return await _send_structured_product_list(incoming, response_text)
 
         # ── Plain text / string response ───────────────────────────────────
         # CRITICAL: response_text can be an empty list [] when GraphRAG finds
@@ -747,12 +773,39 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                         retry_text = retry_data.get("response_text", [])
                         if isinstance(retry_text, list) and retry_text and isinstance(retry_text[0], dict):
                             print(f"[GRAPHRAG] Retry succeeded — {len(retry_text)} products")
-                            response_text = retry_text
-                            # Fall through to structured product list handling below
+                            # BUG FIX: previously this only set response_text with a comment
+                            # "fall through to handling below" — but no such handling existed
+                            # after this point, so the retry's real products were silently
+                            # discarded and the ORIGINAL error text was returned instead.
+                            return await _send_structured_product_list(incoming, retry_text)
+                        elif isinstance(retry_text, dict) and retry_text.get("status") == "needs_clarification":
+                            collections = retry_text.get("available_collections", [])
+                            clarify_msg = retry_text.get(
+                                "message",
+                                "Could you let me know which category you're interested in?"
+                            )
+                            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+                            if collections:
+                                lines.append("")
+                                for i, c in enumerate(collections, 1):
+                                    lines.append(f"*{i}.* {c}")
+                                lines.append("")
+                                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                            return "\n".join(lines)
                         elif isinstance(retry_text, str) and len(retry_text) > 100:
                             reply_str = retry_text
                 except Exception as retry_err:
                     print(f"[GRAPHRAG] Retry failed: {retry_err}")
+
+            # If we still have the original short error/sorry text (retry didn't
+            # produce usable products or a longer message), never expose GraphRAG's
+            # raw error string to the customer — replace with a friendly message.
+            if len(reply_str) <= 100 and ("error" in reply_str.lower() or "sorry" in reply_str.lower()):
+                print(f"[GRAPHRAG] Retry did not resolve the error — sending friendly fallback")
+                return (
+                    f"Sorry {incoming.sender_name}, I'm having trouble finding that right now. "
+                    f"Could you try rephrasing, or browse all products at inventaa.in? 💡"
+                )
 
         if len(reply_str) <= 4096:
             return reply_str
