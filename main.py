@@ -32,6 +32,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+import ast
 import json
 import re
 import time
@@ -572,6 +573,35 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     return summary_text
 
 
+def _coerce_pythonic_dict(value):
+    """
+    GraphRAG is expected to return structured shapes (list of product dicts,
+    or a {"status": "needs_clarification", ...} dict) as real JSON.
+
+    In production we've seen it instead return that SAME dict already
+    stringified on GraphRAG's side (Python's str(dict) — single quotes,
+    not valid JSON) inside response_text. Because that arrives as a plain
+    str, `isinstance(response_text, dict)` below is False, every structured
+    check is skipped, and the literal Python dict text gets sent to the
+    customer verbatim.
+
+    This safely converts a string that LOOKS like a Python dict literal
+    back into a real dict so the existing needs_clarification / product-list
+    handling below can catch it. Anything that isn't a clean dict literal
+    is returned unchanged — never raises, never guesses.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (ValueError, SyntaxError):
+                pass
+    return value
+
+
 async def call_graphrag_api(incoming, session_history: list = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
@@ -699,6 +729,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
             incoming._graphrag_raw = str(data)[:10000]
 
         response_text = data.get("response_text", [])
+        response_text = _coerce_pythonic_dict(response_text)
 
         # ── Clarification request response ──────────────────────────────────
         # GraphRAG can return a THIRD response shape: a dict with
@@ -771,6 +802,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                     if retry_resp.status_code == 200:
                         retry_data = retry_resp.json()
                         retry_text = retry_data.get("response_text", [])
+                        retry_text = _coerce_pythonic_dict(retry_text)
                         if isinstance(retry_text, list) and retry_text and isinstance(retry_text[0], dict):
                             print(f"[GRAPHRAG] Retry succeeded — {len(retry_text)} products")
                             # BUG FIX: previously this only set response_text with a comment
