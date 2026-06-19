@@ -383,7 +383,12 @@ async def process_message(data: dict):
         # return long product lists). Store reply for audit trail + SLA tracking.
         MSG_SPLIT = "\n\n⟨MSG_SPLIT⟩\n\n"
         success = False
-        if MSG_SPLIT in reply:
+        if not reply or not reply.strip():
+            # Empty reply means the handler already sent everything directly
+            # (e.g. installation image + link) — nothing more to send here.
+            print(f"[PIPELINE] Empty reply — handler already sent message(s) directly, skipping duplicate send")
+            success = True
+        elif MSG_SPLIT in reply:
             chunks  = reply.split(MSG_SPLIT)
             for i, chunk in enumerate(chunks):
                 chunk = chunk.strip()
@@ -415,7 +420,8 @@ async def process_message(data: dict):
         if success:
             replied_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             graphrag_raw = getattr(incoming, '_graphrag_raw', None)
-            await update_reply(incoming.message_id, reply, replied_at, graphrag_raw)
+            stored_reply_text = reply if reply and reply.strip() else "[handled directly — image/link sent]"
+            await update_reply(incoming.message_id, stored_reply_text, replied_at, graphrag_raw)
 
     finally:
         # Always release the session lock — even if pipeline crashes.
@@ -463,6 +469,11 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
         # or "tell me more about Romy" — resolve that before calling GraphRAG.
         if session_history:
             follow_up_reply = await _try_resolve_product_followup(incoming, session_history)
+            if follow_up_reply == "__ALREADY_HANDLED__":
+                # Image/link/installation already sent directly to WhatsApp —
+                # return empty string so the outer pipeline sends nothing more,
+                # but does NOT fall through to GraphRAG.
+                return ""
             if follow_up_reply:
                 return follow_up_reply
 
@@ -1419,7 +1430,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     message_id = link_wamid,
                     text       = link_text,
                 )
-            return None  # Skip LLM reply — already sent image + link
+            return "__ALREADY_HANDLED__"  # Sentinel: image+link already sent, skip GraphRAG + LLM reply
 
         elif img_url:
             # Product image only
