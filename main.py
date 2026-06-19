@@ -33,6 +33,7 @@
 
 import asyncio
 import json
+import re
 import httpx
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -1230,6 +1231,28 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             print(f"[FOLLOW-UP] Name match (score={best_score}): '{msg_lower}' -> {matched_product.get('product_name')}")
         else:
             matched_product = None
+
+    # ── Bare-number guard: ask for product NAME instead of guessing ───────────
+    # Numeric list-selection has been removed entirely. If the customer sends
+    # ONLY a bare number with no product name attached, and the bot did NOT
+    # just ask "how many units" (i.e. there's no quantity context to fill),
+    # we must not silently attach that number to whatever product was last
+    # discussed — instead, explicitly ask them to type the product name.
+    if not matched_product:
+        bare_number_only = re.fullmatch(r"\s*\d{1,4}\s*", incoming.text.strip()) is not None
+        if bare_number_only and not parsed.get("selected_product_name"):
+            bot_asked_quantity = False
+            if session_history:
+                recent_bot = [m["content"] for m in session_history[-3:] if m.get("role") == "assistant"]
+                combined = " ".join(recent_bot).lower()
+                bot_asked_quantity = "how many" in combined or "how many units" in combined
+
+            if not bot_asked_quantity:
+                print(f"[FOLLOW-UP] Bare number '{incoming.text.strip()}' with no quantity context — asking for product name instead of guessing")
+                return (
+                    f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
+                    f"you'd like to know more about or order? 😊"
+                )
 
     # ── New-search guard before Case 3 ──────────────────────────────────────
     if not matched_product:
