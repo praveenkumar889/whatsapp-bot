@@ -953,6 +953,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+    # Track quick_parsed so it can be reused below instead of re-parsing
+    # the same message a second time if negotiation doesn't fully resolve.
+    quick_parsed = None
     if neg_state:
         quick_parsed = await _parse_followup_message(incoming, selection, session_history)
         if quick_parsed.get("is_new_search", False):
@@ -1109,8 +1112,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     return result["reply"]
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
-    parsed = await _parse_followup_message(incoming, selection, session_history)
-    print(f"[FOLLOW-UP] LLM parsed: {parsed}")
+    # PERFORMANCE: reuse quick_parsed from the negotiation check above instead
+    # of calling the LLM again with the exact same input — saves one full
+    # sequential round-trip on every follow-up while negotiation is active.
+    if quick_parsed is not None:
+        parsed = quick_parsed
+        print(f"[FOLLOW-UP] Reusing quick_parsed (skipped duplicate LLM call): {parsed}")
+    else:
+        parsed = await _parse_followup_message(incoming, selection, session_history)
+        print(f"[FOLLOW-UP] LLM parsed: {parsed}")
     
     # ── Check if user wants to start a new search ────────────────────────────
     if parsed.get("is_new_search", False):
@@ -1322,7 +1332,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
 
     # ── New-search guard before Case 3 ──────────────────────────────────────
-    if not matched_product:
+    # PERFORMANCE: removed a redundant second LLM call here. _parse_followup_message
+    # (called above at the top of this function) already classifies is_new_search
+    # using the same product list context. If it said False, we trust that result
+    # instead of re-asking the same NEW_SEARCH/FOLLOW_UP question a second time —
+    # this was adding a full extra sequential round-trip to every follow-up.
+    if not matched_product and False:  # disabled: redundant with parsed["is_new_search"] above
         product_names_in_selection = [
             p.get("product_name", p.get("name", "")) for p in selection
             if p.get("product_name") or p.get("name")
