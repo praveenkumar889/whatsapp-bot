@@ -196,6 +196,72 @@ async def extract_quantity(
         return None
 
 
+async def detect_quantity_change(
+    message: str,
+    current_quantity: int,
+    product_name: str,
+    session_history: list = None,
+) -> Optional[int]:
+    """
+    Detects if the customer is asking to CHANGE the quantity already locked
+    into this negotiation — either a relative change ("add 1 more unit",
+    "one more", "add 2 more") or a new absolute number ("make it 6 units",
+    "actually I want 8").
+
+    Returns the NEW TOTAL quantity, or None if the customer is not asking
+    to change quantity at all (negotiating price, accepting, asking a
+    question, etc).
+
+    WHY THIS EXISTS:
+        Once `quantity` is set in handle_negotiation, later messages are
+        NEVER re-checked for quantity at all — extract_quantity() is only
+        called while quantity is still None. A message like "I want to add
+        1 more unit" was silently falling through to detect_acceptance(),
+        which doesn't know what to do with it either, and on a later turn
+        got misread as accepting the OLD quantity at the OLD price.
+        Confirmed in production: customer asked twice to add 1 unit
+        (4 -> 5, which should unlock the 5% tier), quantity never moved
+        off 4, and the second identical message produced a bogus
+        "We're happy to match your offer" order summary still at 4 units.
+        This check must run BEFORE detect_acceptance / detect_counter_offer
+        so quantity-change intent is never swallowed by them.
+    """
+    try:
+        response = _client.chat.completions.create(
+            model       = AZURE_OPENAI_DEPLOYMENT,
+            max_tokens  = 10,
+            temperature = 0,
+            messages    = [
+                {"role": "system", "content": (
+                    f"The customer currently has {current_quantity} units of "
+                    f"'{product_name}' in this order.\n"
+                    "Is the customer asking to CHANGE that quantity — adding "
+                    "more, reducing it, or setting a new total?\n"
+                    "If YES, reply with ONLY the NEW TOTAL quantity as an "
+                    f"integer. Example: current is {current_quantity}, "
+                    f"customer says 'add 1 more unit' -> reply "
+                    f"'{current_quantity + 1}'.\n"
+                    "If the customer is NOT asking to change quantity "
+                    "(e.g. negotiating price, accepting an offer, asking "
+                    "an unrelated question), reply with ONLY 'NONE'.\n"
+                    "Reply with ONLY the integer or 'NONE' — nothing else."
+                )},
+            ] + (session_history[-4:] if session_history else []) + [
+                {"role": "user", "content": message},
+            ],
+        )
+        raw = response.choices[0].message.content.strip().upper()
+        if raw == "NONE" or not raw.isdigit():
+            return None
+        new_qty = int(raw)
+        if new_qty > 0 and new_qty != current_quantity:
+            return new_qty
+        return None
+    except Exception as e:
+        print(f"[NEGOTIATOR] detect_quantity_change failed: {e}")
+        return None
+
+
 async def detect_counter_offer(
     message: str,
     session_history: list = None,
@@ -658,6 +724,7 @@ async def handle_negotiation(
     biz_name     = incoming.biz_name
     rounds       = negotiation_state.get("rounds", 0)
     quantity     = negotiation_state.get("quantity")
+    had_existing_quantity = bool(quantity)
     # Floor MUST be calculated from actual quantity tier — never use fixed multiplier.
     # 10 units → tier=10% → floor=Rs.710 (not Rs.671 which is 15% tier)
     # Recalculate from quantity every time to prevent stale state bugs.
@@ -800,6 +867,58 @@ async def handle_negotiation(
                     "agreed_price": None,
                     "quantity":     None,
                 }
+
+    # ── Step 2.5: Quantity was already locked in — check if THIS message ──────
+    # is asking to change it ("add 1 more unit", "make it 6"). Must run before
+    # Step 3/4 so a quantity-change request is never misread as acceptance or
+    # a price counter-offer using the stale quantity.
+    if had_existing_quantity:
+        new_quantity = await detect_quantity_change(msg, quantity, product_name, session_history)
+        if new_quantity:
+            print(f"[NEGOTIATOR] Quantity change detected: {quantity} -> {new_quantity}")
+            quantity    = new_quantity
+            floor_price = round(price_num * (1 - get_tier_discount(quantity)), 2)
+            offer       = calculate_offer(price_num, quantity)
+            rounds     += 1
+
+            if not offer["has_discount"]:
+                reply = await _reply_no_discount(
+                    sender, product_name, price_num, regular_price,
+                    graphrag_discount_pct, quantity, biz_name
+                )
+                return {
+                    "reply":        reply,
+                    "state":        _updated_state(
+                        quantity          = quantity,
+                        rounds            = rounds,
+                        last_offer_price  = price_num,
+                        floor_price       = floor_price,
+                        awaiting_quantity = False,
+                    ),
+                    "order_ready":  False,
+                    "escalate":     False,
+                    "agreed_price": None,
+                    "quantity":     quantity,
+                }
+
+            reply = await _reply_first_offer(
+                sender, product_name, price_num, regular_price,
+                graphrag_discount_pct, offer, biz_name
+            )
+            return {
+                "reply":        reply,
+                "state":        _updated_state(
+                    quantity          = quantity,
+                    rounds            = rounds,
+                    last_offer_price  = offer["offer_price"],
+                    floor_price       = offer["floor_price"],
+                    awaiting_quantity = False,
+                ),
+                "order_ready":  False,
+                "escalate":     False,
+                "agreed_price": None,
+                "quantity":     quantity,
+            }
 
     # ── Step 3: We have quantity — check acceptance first ─────────────────
     if rounds > 0 and await detect_acceptance(msg, session_history):
