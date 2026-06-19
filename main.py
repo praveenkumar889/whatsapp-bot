@@ -1232,35 +1232,65 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         else:
             matched_product = None
 
-    # ── Bare-number guard: ask for product NAME instead of guessing ───────────
-    # Numeric list-selection has been removed entirely. If the customer sends
-    # ONLY a bare number with no product name attached, and the bot did NOT
-    # just ask "how many units" (i.e. there's no quantity context to fill),
-    # we must not silently attach that number to whatever product was last
-    # discussed — instead, explicitly ask them to type the product name.
+    # ── Deterministic bare-number resolution ───────────────────────────────────
+    # A bare number means exactly ONE of three things, decided purely from the
+    # bot's single most recent message — never guessed, never scanned across
+    # multiple turns:
+    #
+    #   (a) Bot's last message was the freshly-shown product LIST itself
+    #       → number is a 1-based LIST POSITION → map to that product by name,
+    #         then ask "how many units?" (number is NEVER reused as quantity)
+    #   (b) Bot's last message was an explicit quantity question
+    #       → number is the QUANTITY for the product already in context
+    #   (c) Anything else (order summary, product Q&A, installation reply, etc.)
+    #       → ambiguous → ask the customer to reply with the product name
     if not matched_product:
         bare_number_only = re.fullmatch(r"\s*\d{1,4}\s*", incoming.text.strip()) is not None
         if bare_number_only and not parsed.get("selected_product_name"):
-            # CRITICAL: only check the bot's SINGLE most recent message, not a
-            # multi-message window. "How many units you'd like!" is a standard
-            # sign-off on most product replies, so scanning several messages
-            # back made this check almost always true — even when the bot's
-            # actual last message was a fresh product list, not a quantity ask.
-            bot_asked_quantity = False
+
+            last_bot_msg = ""
             if session_history:
                 assistant_msgs = [m["content"] for m in session_history if m.get("role") == "assistant"]
                 if assistant_msgs:
                     last_bot_msg = assistant_msgs[-1].lower()
-                    # Require an explicit, direct quantity question — the bot's
-                    # LAST message must actually be asking "how many", not just
-                    # mentioning it as a closing pleasantry.
-                    bot_asked_quantity = (
-                        "how many units" in last_bot_msg
-                        or "how many would you like" in last_bot_msg
+
+            # Unique marker text that ONLY appears on a freshly-shown product list —
+            # guarantees this number is the customer's first reply to THAT exact list.
+            bot_just_showed_list = "reply with the product name to know more or place an order" in last_bot_msg
+
+            bot_asked_quantity = (
+                "how many units" in last_bot_msg
+                or "how many would you like" in last_bot_msg
+            )
+
+            extracted_number = int(incoming.text.strip())
+
+            if bot_just_showed_list:
+                # (a) Map number -> product by 1-based position in the SAME list
+                # that was just shown. This is deterministic: position N in the
+                # list the bot displayed maps directly to selection[N-1].
+                if 1 <= extracted_number <= len(selection):
+                    matched_product = selection[extracted_number - 1]
+                    print(f"[FOLLOW-UP] List-position pick: '{extracted_number}' -> {matched_product.get('product_name') or matched_product.get('name')} (list size={len(selection)})")
+                    # Force quantity to remain unset — never reuse this number as quantity.
+                    parsed["quantity"] = None
+                    parsed["_number_was_list_position"] = True  # threaded downstream to suppress quantity inference
+                else:
+                    print(f"[FOLLOW-UP] '{extracted_number}' out of range for list size={len(selection)} — asking for product name")
+                    return (
+                        f"Hi {incoming.sender_name}! That number isn't in the list (1-{len(selection)}). "
+                        f"Could you please reply with the *product name* instead? 😊"
                     )
 
-            if not bot_asked_quantity:
-                print(f"[FOLLOW-UP] Bare number '{incoming.text.strip()}' with no quantity context — asking for product name instead of guessing")
+            elif bot_asked_quantity:
+                # (b) Legitimate quantity context — let existing downstream logic
+                # (Case 3 / quantity injection) handle it normally.
+                print(f"[FOLLOW-UP] Bot asked quantity — '{extracted_number}' treated as QUANTITY, falling through")
+
+            else:
+                # (c) Ambiguous — bot's last message was neither a list nor a
+                # quantity question. Do not guess; ask for the product name.
+                print(f"[FOLLOW-UP] Bare number '{extracted_number}' with no list/quantity context — asking for product name instead of guessing")
                 return (
                     f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
                     f"you'd like to know more about or order? 😊"
@@ -1434,7 +1464,13 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     }
 
     # Inject parsed quantity if present
-    parsed_qty = parsed.get("quantity")
+    number_was_list_position = parsed.get("_number_was_list_position", False)
+    if number_was_list_position:
+        parsed_qty = None
+        product_context["customer_just_selected_by_number"] = True
+        print(f"[FOLLOW-UP] Number was used for list-position selection — suppressing quantity inference for this turn")
+    else:
+        parsed_qty = parsed.get("quantity")
     parsed_unit = parsed.get("quantity_unit") or "units"
     if parsed_qty is not None:
         product_context["parsed_order_quantity"] = parsed_qty
@@ -1456,9 +1492,17 @@ Use the conversation history to understand context.
 
 DETECT THE CUSTOMER'S INTENT and respond accordingly:
 
+CRITICAL RULE — NUMBER REUSE: If PRODUCT DATA contains 'customer_just_selected_by_number': true,
+the customer's message was a BARE NUMBER used ONLY to pick this product from a numbered list
+(e.g. typing "50" to select item 50). That number is NOT a quantity, even though it appears
+in the raw message below. In this case you MUST NOT generate an order summary or infer any
+quantity — treat this exactly like INTENT A2 and ask "How many units of [Product Name] would
+you like?" instead.
+
 INTENT A1 — ORDER WITH QUANTITY:
   Customer is specifying they want to buy/order and they specified the quantity (or 'parsed_order_quantity' is present in the PRODUCT DATA).
   Examples: "I want 1 unit", "I'll take 2", "order 5", "3 pieces", "send me 4", or 'parsed_order_quantity' is present.
+  Do NOT apply this intent if 'customer_just_selected_by_number' is true — see CRITICAL RULE above.
   → Generate a clear ORDER SUMMARY:
      • Product: [name]
      • Quantity: [parsed_order_quantity or what customer said]
