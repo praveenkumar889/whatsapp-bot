@@ -33,7 +33,6 @@
 
 import asyncio
 import json
-import re
 import httpx
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -672,7 +671,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                     lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
 
             lines.append(
-                f"\nReply with the number to know more or place an order."
+                f"\nReply with the product name to know more or place an order."
             )
 
             summary_text = "\n".join(lines)
@@ -760,8 +759,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 async def _parse_followup_message(incoming, selection: list, session_history: list = None) -> dict:
     """
     Uses LLM to parse the follow-up message to identify if they are:
-    - selecting indices (selected_indices)
-    - selecting a product by name (selected_product_name)
+    - selecting a product by name (selected_product_name) — NAME ONLY, no numeric index selection
     - specifying quantity/unit (quantity, quantity_unit)
     - requesting comparison (is_comparison)
     - requesting images (asks_for_image)
@@ -781,20 +779,25 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "Analyze the customer's message in the context of the list of products currently displayed to them:\n"
                     + "\n".join(f"- {name}" for name in product_names)
                     + "\n\nExtract the following properties and return ONLY a valid JSON object:\n"
-                    "- selected_indices: list of integers representing 0-based indices from the list the user is explicitly selecting "
-                    "(e.g., '1' → [0], 'first' → [0], 'option 2' → [1]). Rejects numbers representing order quantities "
-                    "(e.g., '1 unit' or 'I want 5' does NOT select index 0 or 4).\n"
-                    "- selected_product_name: the specific product name from the list the user is explicitly mentioning "
-                    "(e.g., 'tell me about Reva' → 'Reva'). Set to null if they are not mentioning a specific product by name.\n"
-                    "- quantity: integer or null (e.g. '1 unit' → 1, 'order 5' → 5)\n"
+                    "- selected_product_name: the specific product name from the list the user is explicitly mentioning by NAME "
+                    "(e.g., 'tell me about Reva' → 'Reva', 'I want the Saraswathi divine light' → 'Saraswathi divine light'). "
+                    "Set to null if they are not mentioning a specific product by name. "
+                    "IMPORTANT: Products are selected by NAME ONLY — a bare number alone (e.g. '5', '12', '57') is NEVER "
+                    "a product selection, it is always a quantity or unrelated number. Do not try to match bare numbers to list positions.\n"
+                    "- quantity: integer or null (e.g. '1 unit' → 1, 'order 5' → 5, or a bare number like '12' when no product name is given → 12)\n"
                     "- quantity_unit: string or null (e.g. 'units', 'pieces', 'kg')\n"
-                    "- is_comparison: boolean (true if user asks to compare 2 or more products from the list)\n"
-                    "- asks_for_image: boolean (true if user explicitly asks to see a picture, image, photo, or visual of the product)\n"
+                    "- is_comparison: boolean (true if user asks to compare 2 or more products from the list, by name)\n"
+                    "- asks_for_image: boolean (true if user asks to see/get/share a picture, image, photo, visual, "
+                    "installation guide, installation steps, installation link, or asks 'where is the link', "
+                    "'send me the link/guide', 'can you share it', or any request implying they want the actual "
+                    "image or link resent — even if they already received one before)\n"
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
                     "a follow-up question or selecting a specific item from the list shown above).\n\n"
-                    "CRITICAL: Use the conversation history to understand context. For example, if the assistant asks 'How many units...' or 'how many' and the user replies with a number (e.g., '5'), this number is the quantity, NOT a selected index.\n"
-                    "CRITICAL: Be extremely careful not to confuse a quantity (e.g. '1 unit') with a list index selection (e.g. '1').\n"
+                    "CRITICAL: If the assistant's last message asked 'How many units...' or 'how many' and the user replies with a number, "
+                    "that number is ALWAYS the quantity.\n"
+                    "CRITICAL: A bare number on its own (e.g. customer just types '12') is ALWAYS a quantity, NEVER a product selection. "
+                    "Products can only be selected by typing their name.\n"
                     "Reply ONLY with the JSON object. No other text."
                 )},
                 *recent_history,
@@ -814,7 +817,6 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
     except Exception as e:
         print(f"[FOLLOW-UP] LLM parser failed: {e}")
         return {
-            "selected_indices": [],
             "selected_product_name": None,
             "quantity": None,
             "quantity_unit": None,
@@ -893,12 +895,11 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     Checks if the customer's message is a follow-up about a product they already
     saw in a previous GraphRAG result (PRODUCT_SELECTION in workflow_sessions).
 
-    RESOLVES THREE CASES:
-        1. Numeric pick/comparison: "1", "compare 1 and 2"
-           → products[index] from PRODUCT_SELECTION, or routes to _handle_comparison
-        2. Name match:     "tell me about Romy", "is Electra waterproof?"
-           → word-score customer message against product names in selection
-        3. Pure follow-up: "is it aluminum?", "what's the warranty?", "1 unit"
+    RESOLVES TWO CASES:
+        1. Name match / comparison: "tell me about Romy", "compare Romy and Reva"
+           → word-score customer message against product names in selection,
+             or routes to _handle_comparison for multi-product comparisons
+        2. Pure follow-up: "is it aluminum?", "what's the warranty?", "1 unit"
            → scan last bot messages to find which product was last discussed
 
     Returns:
@@ -1148,61 +1149,34 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
         return None
 
-    selected_indices = parsed.get("selected_indices") or []
+    # NOTE: numeric list-index selection (picking "57" to mean item #57)
+    # has been REMOVED entirely. It was unreliable on long product lists
+    # (90+ items) and collided with quantity parsing ("57" meaning 57 units).
+    # Customers must now select products by NAME only.
     is_comparison = parsed.get("is_comparison", False)
     asks_for_image = parsed.get("asks_for_image", False)
 
-    # ── Deterministic override for ambiguous bare numbers (Option B) ──────────
-    # The LLM can misjudge "I want 56 product" as neither a valid index nor a
-    # valid quantity. Use code-level math instead of relying on a single LLM
-    # guess for this specific ambiguity.
-    number_used_as_index = False
-    bare_number_match = re.fullmatch(r"\s*(\d{1,4})\s*", incoming.text.strip())
-    extracted_number   = None
-    if bare_number_match:
-        extracted_number = int(bare_number_match.group(1))
-    else:
-        nums = re.findall(r"\d+", incoming.text)
-        quantity_words = ("unit", "units", "pcs", "pieces", "kg", "qty", "quantity", "nos")
-        has_quantity_word = any(w in incoming.text.lower() for w in quantity_words)
-        if len(nums) == 1 and not has_quantity_word:
-            extracted_number = int(nums[0])
-
-    if extracted_number is not None:
-        bot_asked_quantity = False
-        if session_history:
-            recent_bot = [m["content"] for m in session_history[-3:] if m.get("role") == "assistant"]
-            combined = " ".join(recent_bot).lower()
-            bot_asked_quantity = "how many" in combined or "how many units" in combined
-
-        list_size = len(selection)
-
-        if bot_asked_quantity:
-            print(f"[FOLLOW-UP] Bot just asked quantity — '{extracted_number}' is QUANTITY, not index")
-            selected_indices = []
-            if parsed.get("quantity") is None:
-                parsed["quantity"] = extracted_number
-        elif 1 <= extracted_number <= list_size:
-            zero_based = extracted_number - 1
-            print(f"[FOLLOW-UP] Deterministic index pick: '{extracted_number}' -> position {zero_based} (list size={list_size})")
-            selected_indices = [zero_based]
-            number_used_as_index = True  # CRITICAL: this number is consumed as a selection,
-                                          # must NOT be reused as quantity downstream
-        else:
-            print(f"[FOLLOW-UP] '{extracted_number}' is out of range for list size={list_size} — treating as QUANTITY")
-            selected_indices = []
-            if parsed.get("quantity") is None:
-                parsed["quantity"] = extracted_number
-
     matched_product = None
 
-    # ── Case 1: Numeric pick — single or multiple (comparison) ────────────────
-    if is_comparison or len(selected_indices) >= 2:
-        compared_indices = [idx for idx in selected_indices if 0 <= idx < len(selection)]
-        if not compared_indices:
-            compared_indices = list(range(len(selection)))
-        compared = [selection[i] for i in compared_indices]
-        print(f"[FOLLOW-UP] Comparison mode: indices={compared_indices}")
+    # ── Case 1: Comparison by name (2+ products mentioned by name) ────────────
+    if is_comparison:
+        compared_names = []
+        if parsed.get("selected_product_name"):
+            compared_names.append(parsed["selected_product_name"])
+        # Fall back to comparing all currently shown products if the LLM
+        # didn't extract specific names for a requested comparison.
+        compared = []
+        if compared_names:
+            for name in compared_names:
+                name_lower = name.lower().strip()
+                for p in selection:
+                    pname = (p.get("product_name") or p.get("name") or "").lower()
+                    if name_lower in pname or pname in name_lower:
+                        compared.append(p)
+                        break
+        if not compared:
+            compared = selection
+        print(f"[FOLLOW-UP] Comparison mode (by name): {[c.get('product_name') or c.get('name') for c in compared]}")
 
         # If user explicitly asked for images, send them
         if asks_for_image:
@@ -1225,12 +1199,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         )
 
         return await _handle_comparison(incoming, compared, session_history)
-
-    elif len(selected_indices) == 1:
-        idx = selected_indices[0]
-        if 0 <= idx < len(selection):
-            matched_product = selection[idx]
-            print(f"[FOLLOW-UP] Numeric pick: index {idx} -> {matched_product.get('product_name')}")
 
     # ── Case 2: Name match ──────────────────────────────────────────────────
     # Check if LLM parsed a specific product name first
@@ -1431,17 +1399,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     }
 
     # Inject parsed quantity if present
-    # CRITICAL: if this number was already consumed as a LIST SELECTION
-    # (e.g. customer typed "57" to pick item #57), it must NEVER be reused
-    # as a quantity downstream — even if the LLM below would otherwise
-    # infer it from the raw message text. This was the root cause of
-    # "57" simultaneously selecting a product AND being used as qty=57.
-    if number_used_as_index:
-        parsed_qty = None
-        product_context["customer_just_selected_by_number"] = True
-        print(f"[FOLLOW-UP] Number was used for list selection — suppressing quantity inference for this turn")
-    else:
-        parsed_qty = parsed.get("quantity")
+    parsed_qty = parsed.get("quantity")
     parsed_unit = parsed.get("quantity_unit") or "units"
     if parsed_qty is not None:
         product_context["parsed_order_quantity"] = parsed_qty
@@ -1463,17 +1421,9 @@ Use the conversation history to understand context.
 
 DETECT THE CUSTOMER'S INTENT and respond accordingly:
 
-CRITICAL RULE — NUMBER REUSE: If PRODUCT DATA contains 'customer_just_selected_by_number': true,
-the customer's message was a BARE NUMBER used ONLY to pick this product from a numbered list
-(e.g. typing "57" to select item 57). That number is NOT a quantity, even though it appears
-in the raw message. In this case you MUST NOT generate an order summary or infer any quantity —
-treat this exactly like INTENT B (product question / just selected, no quantity yet) and ask
-"How many units of [Product Name] would you like?" instead.
-
 INTENT A1 — ORDER WITH QUANTITY:
   Customer is specifying they want to buy/order and they specified the quantity (or 'parsed_order_quantity' is present in the PRODUCT DATA).
   Examples: "I want 1 unit", "I'll take 2", "order 5", "3 pieces", "send me 4", or 'parsed_order_quantity' is present.
-  Do NOT apply this intent if 'customer_just_selected_by_number' is true — see CRITICAL RULE above.
   → Generate a clear ORDER SUMMARY:
      • Product: [name]
      • Quantity: [parsed_order_quantity or what customer said]
