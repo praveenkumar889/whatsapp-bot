@@ -1287,8 +1287,38 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
 
     if not cached_product:
-        print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — falling through to GraphRAG")
-        return None
+        # Cache miss — but matched_product (from the in-memory GraphRAG selection list)
+        # already has installation_url, warranty, image_url etc. Use it directly instead
+        # of bailing out to GraphRAG, which would lose this data entirely.
+        print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — using in-memory selection data instead")
+        cached_product = {
+            "product_name":                matched_product.get("product_name") or matched_product.get("name"),
+            "sku":                         matched_product.get("sku"),
+            "list_price":                  float(matched_product.get("price_num") or matched_product.get("list_price") or 0),
+            "regular_price":               matched_product.get("regular_price", matched_product.get("price_num", 0)),
+            "discount_pct":                matched_product.get("discount_percentage", matched_product.get("discount_pct", 0)),
+            "image_url":                   matched_product.get("image_url"),
+            "installation_url":            matched_product.get("installation_url"),
+            "product_url":                 matched_product.get("url") or matched_product.get("product_url"),
+            "rating":                      matched_product.get("rating", 0),
+            "review_count":                matched_product.get("review_count", 0),
+            "feature_descriptions":        matched_product.get("feature_descriptions", ""),
+            "warranty":                    matched_product.get("warranty", ""),
+            "replacement_exchange_policy": matched_product.get("replacement_exchange_policy", ""),
+            "features":                    [],
+            "specs":                       [],
+            "policies":                    [],
+            "faqs":                        [],
+            "warranties":                  [],
+        }
+        # Backfill the DB cache for next time so this doesn't repeat
+        try:
+            sku = matched_product.get("sku")
+            if sku:
+                await save_product_api_response(incoming.tenant_id, sku, [cached_product])
+                print(f"[FOLLOW-UP] Backfilled product_cache for SKU={sku}")
+        except Exception as e:
+            print(f"[FOLLOW-UP] Cache backfill failed (non-critical): {e}")
 
     # ── Send image only if explicitly requested ───────────────────────────
     if asks_for_image:
