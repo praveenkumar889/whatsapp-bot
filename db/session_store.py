@@ -625,12 +625,17 @@ async def save_graphrag_product_selection(
             for p in products
         ])
 
+        # CRITICAL: order by created_at desc so we always find the SAME row
+        # that get_graphrag_product_selection() would read back. Without this
+        # ordering, an UPDATE could silently target a different, older row
+        # than the one later reads return — causing position lookups to
+        # resolve against stale, unrelated product data.
         existing = _get_client().table("workflow_sessions") \
             .select("id") \
             .eq("tenant_id",  tenant_id) \
             .eq("session_id", session_id) \
             .eq("status", "PRODUCT_SELECTION") \
-            .limit(1) \
+            .order("created_at", desc=True) \
             .execute()
 
         row = {
@@ -648,10 +653,22 @@ async def save_graphrag_product_selection(
         }
 
         if existing.data:
+            # Update the most recent row (first in desc-ordered results).
+            most_recent_id = existing.data[0]["id"]
             _get_client().table("workflow_sessions") \
                 .update(row) \
-                .eq("id", existing.data[0]["id"]) \
+                .eq("id", most_recent_id) \
                 .execute()
+
+            # Defensively remove any OTHER stale PRODUCT_SELECTION rows for
+            # this session so save/read can never disagree on which is current.
+            if len(existing.data) > 1:
+                stale_ids = [r["id"] for r in existing.data[1:]]
+                _get_client().table("workflow_sessions") \
+                    .delete() \
+                    .in_("id", stale_ids) \
+                    .execute()
+                print(f"[DB] Removed {len(stale_ids)} stale PRODUCT_SELECTION row(s) for {session_id}")
         else:
             _get_client().table("workflow_sessions") \
                 .insert(row) \
