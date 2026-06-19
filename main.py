@@ -788,7 +788,10 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "- quantity: integer or null (e.g. '1 unit' → 1, 'order 5' → 5)\n"
                     "- quantity_unit: string or null (e.g. 'units', 'pieces', 'kg')\n"
                     "- is_comparison: boolean (true if user asks to compare 2 or more products from the list)\n"
-                    "- asks_for_image: boolean (true if user explicitly asks to see a picture, image, photo, or visual of the product)\n"
+                    "- asks_for_image: boolean (true if user asks to see/get/share a picture, image, photo, visual, "
+                    "installation guide, installation steps, installation link, or asks 'where is the link', "
+                    "'send me the link/guide', 'can you share it', or any request implying they want the actual "
+                    "image or link resent — even if they already received one before)\n"
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
                     "a follow-up question or selecting a specific item from the list shown above).\n\n"
@@ -1434,11 +1437,14 @@ INTENT B — PRODUCT QUESTION:
   → End with: "To order, just tell me how many units you'd like!"
 
 INTENT C — INSTALLATION QUESTION:
-  Customer asks about installation, setup, fitting, mounting, or how to install.
-  → The installation image and link are already sent separately by the system before this reply.
-  → Say: "I've sent you the installation guide image and link above! ??"
+  Customer asks about installation, setup, fitting, mounting, or how to install,
+  but this turn did NOT trigger a fresh image/link send (no installation_url available,
+  or it's a vague follow-up). Do NOT claim anything was already sent unless the customer's
+  own message or recent history shows the bot just sent it in this exchange.
+  → If installation_url exists in product data, say: "Let me get that installation guide for you — please give me one moment, or reply 'send installation guide' and I'll share it right away."
+  → If installation_url does NOT exist: "I don't have an installation guide image for this product yet — please contact our team for installation help."
   → Then briefly describe any installation tips from feature_descriptions if available.
-  → End with: "To order, just tell me how many units you'd like!" End with: "To order, just tell me how many units you'd like!"
+  → End with: "To order, just tell me how many units you'd like!"
 
 RULES:
 - Address the customer as {incoming.sender_name}
@@ -1448,7 +1454,7 @@ RULES:
 - NEVER include raw URLs or markdown links like [text](url) in your reply — images are sent separately by the system
 - NEVER mention installation_url, image_url or any URL from product data in your text reply
 - For warranty questions: read from the "warranty" field and state it clearly in plain text
-- For installation questions: just say the image was sent above, do not paste the URL
+- NEVER claim you "already sent" an image, link, or guide unless it was sent earlier in THIS visible conversation history — if unsure, offer to send it now instead of claiming it was sent
 
 PRODUCT DATA:
 {json.dumps(product_context, indent=2)}
