@@ -34,6 +34,7 @@
 import asyncio
 import json
 import re
+import time
 import httpx
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -165,6 +166,7 @@ async def process_message(data: dict):
     Called as a background task for every inbound WhatsApp message.
     Never raises — customer always gets a reply even if individual steps fail.
     """
+    _t_pipeline_start = time.monotonic()
 
     # ── Step 1: Parse webhook ──────────────────────────────────────────────
     # Translates raw Meta JSON → clean IncomingMessage object.
@@ -265,7 +267,9 @@ async def process_message(data: dict):
         # Sends customer message + session history to Azure OpenAI GPT-4.1.
         # Returns: FAQ_KNOWLEDGE | HUMAN_ESCALATION | GREETING | UNKNOWN
         # History context lets AI understand follow-up messages like "1" or "Reva".
+        _t_intent_start = time.monotonic()
         result = await classify_intent(incoming.text, session_history)
+        print(f"[TIMING] classify_intent: {time.monotonic() - _t_intent_start:.2f}s")
         print(f"[INTENT]   {result.intent}  confidence={result.confidence_score}")
 
         # ── Step 7: Update intent in DB ────────────────────────────────────
@@ -422,6 +426,8 @@ async def process_message(data: dict):
             graphrag_raw = getattr(incoming, '_graphrag_raw', None)
             stored_reply_text = reply if reply and reply.strip() else "[handled directly — image/link sent]"
             await update_reply(incoming.message_id, stored_reply_text, replied_at, graphrag_raw)
+
+        print(f"[TIMING] TOTAL pipeline time: {time.monotonic() - _t_pipeline_start:.2f}s")
 
     finally:
         # Always release the session lock — even if pipeline crashes.
@@ -1001,7 +1007,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                     neg_state = None
 
-    if neg_state or await is_negotiation_request(incoming.text, session_history):
+    _t_neg_check_start = time.monotonic()
+    _is_neg_req = await is_negotiation_request(incoming.text, session_history)
+    print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
+    if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
         # 1. Active negotiation state (already has product_name)
         # 2. Last discussed product from DB
@@ -1119,7 +1128,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         parsed = quick_parsed
         print(f"[FOLLOW-UP] Reusing quick_parsed (skipped duplicate LLM call): {parsed}")
     else:
+        _t_parse_start = time.monotonic()
         parsed = await _parse_followup_message(incoming, selection, session_history)
+        print(f"[TIMING] _parse_followup_message: {time.monotonic() - _t_parse_start:.2f}s")
         print(f"[FOLLOW-UP] LLM parsed: {parsed}")
     
     # ── Check if user wants to start a new search ────────────────────────────
@@ -1519,6 +1530,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     recent_history = session_history[-6:] if session_history else []
 
     try:
+        _t_final_start = time.monotonic()
         response = _ai_client.chat.completions.create(
             model       = AZURE_OPENAI_DEPLOYMENT,
             max_tokens  = 400,
@@ -1564,11 +1576,14 @@ INTENT B — PRODUCT QUESTION:
   → End with: "To order, just tell me how many units you'd like!"
 
 INTENT C — INSTALLATION QUESTION:
-  Customer asks about installation, setup, fitting, mounting, or how to install.
-  → The installation image and link are already sent separately by the system before this reply.
-  → Say: "I've sent you the installation guide image and link above! ??"
+  Customer asks about installation, setup, fitting, mounting, or how to install,
+  but this turn did NOT trigger a fresh image/link send (no installation_url available,
+  or it's a vague follow-up). Do NOT claim anything was already sent unless the customer's
+  own message or recent history shows the bot just sent it in this exchange.
+  → If installation_url exists in product data, say: "Let me get that installation guide for you — please give me one moment, or reply 'send installation guide' and I'll share it right away."
+  → If installation_url does NOT exist: "I don't have an installation guide image for this product yet — please contact our team for installation help."
   → Then briefly describe any installation tips from feature_descriptions if available.
-  → End with: "To order, just tell me how many units you'd like!" End with: "To order, just tell me how many units you'd like!"
+  → End with: "To order, just tell me how many units you'd like!"
 
 RULES:
 - Address the customer as {incoming.sender_name}
@@ -1578,7 +1593,7 @@ RULES:
 - NEVER include raw URLs or markdown links like [text](url) in your reply — images are sent separately by the system
 - NEVER mention installation_url, image_url or any URL from product data in your text reply
 - For warranty questions: read from the "warranty" field and state it clearly in plain text
-- For installation questions: just say the image was sent above, do not paste the URL
+- NEVER claim you "already sent" an image, link, or guide unless it was sent earlier in THIS visible conversation history — if unsure, offer to send it now instead of claiming it was sent
 
 PRODUCT DATA:
 {json.dumps(product_context, indent=2)}
@@ -1588,6 +1603,7 @@ PRODUCT DATA:
             ],
         )
         reply = response.choices[0].message.content.strip()
+        print(f"[TIMING] Final answer LLM call: {time.monotonic() - _t_final_start:.2f}s")
         print(f"[FOLLOW-UP] LLM answered for product '{product_name}'")
 
         # Save pending order to DB if quantity is specified
