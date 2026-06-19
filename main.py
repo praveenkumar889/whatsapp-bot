@@ -1241,11 +1241,23 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     if not matched_product:
         bare_number_only = re.fullmatch(r"\s*\d{1,4}\s*", incoming.text.strip()) is not None
         if bare_number_only and not parsed.get("selected_product_name"):
+            # CRITICAL: only check the bot's SINGLE most recent message, not a
+            # multi-message window. "How many units you'd like!" is a standard
+            # sign-off on most product replies, so scanning several messages
+            # back made this check almost always true — even when the bot's
+            # actual last message was a fresh product list, not a quantity ask.
             bot_asked_quantity = False
             if session_history:
-                recent_bot = [m["content"] for m in session_history[-3:] if m.get("role") == "assistant"]
-                combined = " ".join(recent_bot).lower()
-                bot_asked_quantity = "how many" in combined or "how many units" in combined
+                assistant_msgs = [m["content"] for m in session_history if m.get("role") == "assistant"]
+                if assistant_msgs:
+                    last_bot_msg = assistant_msgs[-1].lower()
+                    # Require an explicit, direct quantity question — the bot's
+                    # LAST message must actually be asking "how many", not just
+                    # mentioning it as a closing pleasantry.
+                    bot_asked_quantity = (
+                        "how many units" in last_bot_msg
+                        or "how many would you like" in last_bot_msg
+                    )
 
             if not bot_asked_quantity:
                 print(f"[FOLLOW-UP] Bare number '{incoming.text.strip()}' with no quantity context — asking for product name instead of guessing")
