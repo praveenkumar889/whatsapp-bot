@@ -33,6 +33,7 @@
 
 import asyncio
 import json
+import re
 import httpx
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -382,12 +383,7 @@ async def process_message(data: dict):
         # return long product lists). Store reply for audit trail + SLA tracking.
         MSG_SPLIT = "\n\n⟨MSG_SPLIT⟩\n\n"
         success = False
-        if not reply or not reply.strip():
-            # Empty reply means the handler already sent everything directly
-            # (e.g. installation image + link) — nothing more to send here.
-            print(f"[PIPELINE] Empty reply — handler already sent message(s) directly, skipping duplicate send")
-            success = True
-        elif MSG_SPLIT in reply:
+        if MSG_SPLIT in reply:
             chunks  = reply.split(MSG_SPLIT)
             for i, chunk in enumerate(chunks):
                 chunk = chunk.strip()
@@ -419,8 +415,7 @@ async def process_message(data: dict):
         if success:
             replied_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             graphrag_raw = getattr(incoming, '_graphrag_raw', None)
-            stored_reply_text = reply if reply and reply.strip() else "[handled directly — image/link sent]"
-            await update_reply(incoming.message_id, stored_reply_text, replied_at, graphrag_raw)
+            await update_reply(incoming.message_id, reply, replied_at, graphrag_raw)
 
     finally:
         # Always release the session lock — even if pipeline crashes.
@@ -468,11 +463,6 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
         # or "tell me more about Romy" — resolve that before calling GraphRAG.
         if session_history:
             follow_up_reply = await _try_resolve_product_followup(incoming, session_history)
-            if follow_up_reply == "__ALREADY_HANDLED__":
-                # Image/link/installation already sent directly to WhatsApp —
-                # return empty string so the outer pipeline sends nothing more,
-                # but does NOT fall through to GraphRAG.
-                return ""
             if follow_up_reply:
                 return follow_up_reply
 
@@ -799,10 +789,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "- quantity: integer or null (e.g. '1 unit' → 1, 'order 5' → 5)\n"
                     "- quantity_unit: string or null (e.g. 'units', 'pieces', 'kg')\n"
                     "- is_comparison: boolean (true if user asks to compare 2 or more products from the list)\n"
-                    "- asks_for_image: boolean (true if user asks to see/get/share a picture, image, photo, visual, "
-                    "installation guide, installation steps, installation link, or asks 'where is the link', "
-                    "'send me the link/guide', 'can you share it', or any request implying they want the actual "
-                    "image or link resent — even if they already received one before)\n"
+                    "- asks_for_image: boolean (true if user explicitly asks to see a picture, image, photo, or visual of the product)\n"
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
                     "a follow-up question or selecting a specific item from the list shown above).\n\n"
@@ -1165,6 +1152,48 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     is_comparison = parsed.get("is_comparison", False)
     asks_for_image = parsed.get("asks_for_image", False)
 
+    # ── Deterministic override for ambiguous bare numbers (Option B) ──────────
+    # The LLM can misjudge "I want 56 product" as neither a valid index nor a
+    # valid quantity. Use code-level math instead of relying on a single LLM
+    # guess for this specific ambiguity.
+    number_used_as_index = False
+    bare_number_match = re.fullmatch(r"\s*(\d{1,4})\s*", incoming.text.strip())
+    extracted_number   = None
+    if bare_number_match:
+        extracted_number = int(bare_number_match.group(1))
+    else:
+        nums = re.findall(r"\d+", incoming.text)
+        quantity_words = ("unit", "units", "pcs", "pieces", "kg", "qty", "quantity", "nos")
+        has_quantity_word = any(w in incoming.text.lower() for w in quantity_words)
+        if len(nums) == 1 and not has_quantity_word:
+            extracted_number = int(nums[0])
+
+    if extracted_number is not None:
+        bot_asked_quantity = False
+        if session_history:
+            recent_bot = [m["content"] for m in session_history[-3:] if m.get("role") == "assistant"]
+            combined = " ".join(recent_bot).lower()
+            bot_asked_quantity = "how many" in combined or "how many units" in combined
+
+        list_size = len(selection)
+
+        if bot_asked_quantity:
+            print(f"[FOLLOW-UP] Bot just asked quantity — '{extracted_number}' is QUANTITY, not index")
+            selected_indices = []
+            if parsed.get("quantity") is None:
+                parsed["quantity"] = extracted_number
+        elif 1 <= extracted_number <= list_size:
+            zero_based = extracted_number - 1
+            print(f"[FOLLOW-UP] Deterministic index pick: '{extracted_number}' -> position {zero_based} (list size={list_size})")
+            selected_indices = [zero_based]
+            number_used_as_index = True  # CRITICAL: this number is consumed as a selection,
+                                          # must NOT be reused as quantity downstream
+        else:
+            print(f"[FOLLOW-UP] '{extracted_number}' is out of range for list size={list_size} — treating as QUANTITY")
+            selected_indices = []
+            if parsed.get("quantity") is None:
+                parsed["quantity"] = extracted_number
+
     matched_product = None
 
     # ── Case 1: Numeric pick — single or multiple (comparison) ────────────────
@@ -1298,38 +1327,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
 
     if not cached_product:
-        # Cache miss — but matched_product (from the in-memory GraphRAG selection list)
-        # already has installation_url, warranty, image_url etc. Use it directly instead
-        # of bailing out to GraphRAG, which would lose this data entirely.
-        print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — using in-memory selection data instead")
-        cached_product = {
-            "product_name":                matched_product.get("product_name") or matched_product.get("name"),
-            "sku":                         matched_product.get("sku"),
-            "list_price":                  float(matched_product.get("price_num") or matched_product.get("list_price") or 0),
-            "regular_price":               matched_product.get("regular_price", matched_product.get("price_num", 0)),
-            "discount_pct":                matched_product.get("discount_percentage", matched_product.get("discount_pct", 0)),
-            "image_url":                   matched_product.get("image_url"),
-            "installation_url":            matched_product.get("installation_url"),
-            "product_url":                 matched_product.get("url") or matched_product.get("product_url"),
-            "rating":                      matched_product.get("rating", 0),
-            "review_count":                matched_product.get("review_count", 0),
-            "feature_descriptions":        matched_product.get("feature_descriptions", ""),
-            "warranty":                    matched_product.get("warranty", ""),
-            "replacement_exchange_policy": matched_product.get("replacement_exchange_policy", ""),
-            "features":                    [],
-            "specs":                       [],
-            "policies":                    [],
-            "faqs":                        [],
-            "warranties":                  [],
-        }
-        # Backfill the DB cache for next time so this doesn't repeat
-        try:
-            sku = matched_product.get("sku")
-            if sku:
-                await save_product_api_response(incoming.tenant_id, sku, [cached_product])
-                print(f"[FOLLOW-UP] Backfilled product_cache for SKU={sku}")
-        except Exception as e:
-            print(f"[FOLLOW-UP] Cache backfill failed (non-critical): {e}")
+        print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — falling through to GraphRAG")
+        return None
 
     # ── Send image only if explicitly requested ───────────────────────────
     if asks_for_image:
@@ -1387,7 +1386,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     message_id = link_wamid,
                     text       = link_text,
                 )
-            return "__ALREADY_HANDLED__"  # Sentinel: image+link already sent, skip GraphRAG + LLM reply
+            return None  # Skip LLM reply — already sent image + link
 
         elif img_url:
             # Product image only
@@ -1432,7 +1431,17 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     }
 
     # Inject parsed quantity if present
-    parsed_qty = parsed.get("quantity")
+    # CRITICAL: if this number was already consumed as a LIST SELECTION
+    # (e.g. customer typed "57" to pick item #57), it must NEVER be reused
+    # as a quantity downstream — even if the LLM below would otherwise
+    # infer it from the raw message text. This was the root cause of
+    # "57" simultaneously selecting a product AND being used as qty=57.
+    if number_used_as_index:
+        parsed_qty = None
+        product_context["customer_just_selected_by_number"] = True
+        print(f"[FOLLOW-UP] Number was used for list selection — suppressing quantity inference for this turn")
+    else:
+        parsed_qty = parsed.get("quantity")
     parsed_unit = parsed.get("quantity_unit") or "units"
     if parsed_qty is not None:
         product_context["parsed_order_quantity"] = parsed_qty
@@ -1454,9 +1463,17 @@ Use the conversation history to understand context.
 
 DETECT THE CUSTOMER'S INTENT and respond accordingly:
 
+CRITICAL RULE — NUMBER REUSE: If PRODUCT DATA contains 'customer_just_selected_by_number': true,
+the customer's message was a BARE NUMBER used ONLY to pick this product from a numbered list
+(e.g. typing "57" to select item 57). That number is NOT a quantity, even though it appears
+in the raw message. In this case you MUST NOT generate an order summary or infer any quantity —
+treat this exactly like INTENT B (product question / just selected, no quantity yet) and ask
+"How many units of [Product Name] would you like?" instead.
+
 INTENT A1 — ORDER WITH QUANTITY:
   Customer is specifying they want to buy/order and they specified the quantity (or 'parsed_order_quantity' is present in the PRODUCT DATA).
   Examples: "I want 1 unit", "I'll take 2", "order 5", "3 pieces", "send me 4", or 'parsed_order_quantity' is present.
+  Do NOT apply this intent if 'customer_just_selected_by_number' is true — see CRITICAL RULE above.
   → Generate a clear ORDER SUMMARY:
      • Product: [name]
      • Quantity: [parsed_order_quantity or what customer said]
@@ -1478,14 +1495,11 @@ INTENT B — PRODUCT QUESTION:
   → End with: "To order, just tell me how many units you'd like!"
 
 INTENT C — INSTALLATION QUESTION:
-  Customer asks about installation, setup, fitting, mounting, or how to install,
-  but this turn did NOT trigger a fresh image/link send (no installation_url available,
-  or it's a vague follow-up). Do NOT claim anything was already sent unless the customer's
-  own message or recent history shows the bot just sent it in this exchange.
-  → If installation_url exists in product data, say: "Let me get that installation guide for you — please give me one moment, or reply 'send installation guide' and I'll share it right away."
-  → If installation_url does NOT exist: "I don't have an installation guide image for this product yet — please contact our team for installation help."
+  Customer asks about installation, setup, fitting, mounting, or how to install.
+  → The installation image and link are already sent separately by the system before this reply.
+  → Say: "I've sent you the installation guide image and link above! ??"
   → Then briefly describe any installation tips from feature_descriptions if available.
-  → End with: "To order, just tell me how many units you'd like!"
+  → End with: "To order, just tell me how many units you'd like!" End with: "To order, just tell me how many units you'd like!"
 
 RULES:
 - Address the customer as {incoming.sender_name}
@@ -1495,7 +1509,7 @@ RULES:
 - NEVER include raw URLs or markdown links like [text](url) in your reply — images are sent separately by the system
 - NEVER mention installation_url, image_url or any URL from product data in your text reply
 - For warranty questions: read from the "warranty" field and state it clearly in plain text
-- NEVER claim you "already sent" an image, link, or guide unless it was sent earlier in THIS visible conversation history — if unsure, offer to send it now instead of claiming it was sent
+- For installation questions: just say the image was sent above, do not paste the URL
 
 PRODUCT DATA:
 {json.dumps(product_context, indent=2)}
