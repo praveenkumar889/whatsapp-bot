@@ -489,21 +489,7 @@ async def process_message(data: dict):
                     if prompt:
                         reply = f"{reply}\n\n{prompt}"
         elif result.intent == "HUMAN_ESCALATION":
-            # ── Negotiation override ───────────────────────────────────────
-            # When an active negotiation is in progress, messages like
-            # "can i get for 3500?" get classified as HUMAN_ESCALATION
-            # (classifier sees price complaint) instead of negotiation.
-            # This skips call_graphrag_api entirely — the negotiation handler
-            # never runs — and the customer gets "team will contact you"
-            # instead of a proper counter-offer.
-            # Fix: if active neg_state exists, redirect to call_graphrag_api
-            # where _try_resolve_product_followup will handle it correctly.
-            _esc_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
-            if _esc_neg_state and _esc_neg_state.get("product_name"):
-                print(f"[ESCALATION] Active negotiation detected — redirecting to negotiation handler")
-                reply = await call_graphrag_api(incoming, session_history)
-            else:
-                reply = await handle_escalation(incoming)
+            reply = await handle_escalation(incoming)
         elif result.intent == "GREETING":
             reply = await handle_greeting(incoming)
         else:
@@ -1556,32 +1542,58 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 _has_pronoun = False
 
         if _has_pronoun and len(compared) <= 1:
+            # ── Resolve "this" from session history first (most reliable) ─
+            # The DB lookup (last_discussed_product) has a timing gap: the save
+            # happens at the END of the previous pipeline run, but both messages
+            # can arrive within the same second. Session history is set at the
+            # START of this pipeline run so it's guaranteed to be current.
+            # Use _get_active_product_context to scan bot's recent messages
+            # (e.g. the Villa brief) and find which product "this" refers to.
             try:
-                from db.session_store import get_last_discussed_product
-                _last = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
-                if _last:
-                    _last_lower = _last.lower().strip()
-                    _last_p = None
-                    for p in selection:
-                        pname = (p.get("product_name") or p.get("name") or "").lower()
-                        if _last_lower[:12] in pname or pname[:12] in _last_lower:
-                            _last_p = p
-                            break
-                    if _last_p is None:
-                        try:
-                            _cached = await get_cached_product_by_name(incoming.tenant_id, _last)
-                            _last_p = _cached if _cached else {"product_name": _last, "name": _last}
-                        except Exception:
-                            _last_p = {"product_name": _last, "name": _last}
+                _context_for_pronoun = await _get_active_product_context(
+                    incoming, selection, session_history
+                )
+                for _cp in _context_for_pronoun:
+                    _cp_name = (_cp.get("product_name") or _cp.get("name") or "").lower()
                     already_in = any(
-                        _last_lower[:12] in (p.get("product_name") or p.get("name") or "").lower()
+                        _cp_name[:12] in (p.get("product_name") or p.get("name") or "").lower()
                         for p in compared
                     )
                     if not already_in:
-                        compared.insert(0, _last_p)
-                        print(f"[FOLLOW-UP] Pronoun resolved to last-discussed: '{_last}'")
+                        compared.insert(0, _cp)
+                        print(f"[FOLLOW-UP] Pronoun 'this' resolved via session history: '{_cp.get('product_name') or _cp.get('name')}'")
+                        break  # Only need the single most recently discussed product
             except Exception as e:
-                print(f"[FOLLOW-UP] Pronoun resolution failed: {e}")
+                print(f"[FOLLOW-UP] Pronoun history resolution failed: {e}")
+
+            # ── Fallback: DB lookup if history resolution didn't find anything ─
+            if len(compared) <= 1:
+                try:
+                    from db.session_store import get_last_discussed_product
+                    _last = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+                    if _last:
+                        _last_lower = _last.lower().strip()
+                        _last_p = None
+                        for p in selection:
+                            pname = (p.get("product_name") or p.get("name") or "").lower()
+                            if _last_lower[:12] in pname or pname[:12] in _last_lower:
+                                _last_p = p
+                                break
+                        if _last_p is None:
+                            try:
+                                _cached = await get_cached_product_by_name(incoming.tenant_id, _last)
+                                _last_p = _cached if _cached else {"product_name": _last, "name": _last}
+                            except Exception:
+                                _last_p = {"product_name": _last, "name": _last}
+                        already_in = any(
+                            _last_lower[:12] in (p.get("product_name") or p.get("name") or "").lower()
+                            for p in compared
+                        )
+                        if not already_in:
+                            compared.insert(0, _last_p)
+                            print(f"[FOLLOW-UP] Pronoun resolved via DB fallback: '{_last}'")
+                except Exception as e:
+                    print(f"[FOLLOW-UP] Pronoun DB fallback failed: {e}")
 
         # ── Level 3: Active context from session history ──────────────────
         # "suggest me one with low budget" after discussing Romy →
