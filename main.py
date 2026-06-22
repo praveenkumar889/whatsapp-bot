@@ -952,6 +952,92 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
         }
 
 
+async def _get_active_product_context(
+    incoming,
+    selection: list,
+    session_history: list,
+) -> list:
+    """
+    Scans recent session history to find which specific products were
+    being discussed/compared, and returns those as the active context.
+
+    WHY THIS EXISTS:
+        When customer asks "which is better for my budget?" after discussing
+        Juno + Nura, they mean those two — not all 18 products in the list.
+        But "which is better?" has no names, so the comparison block finds
+        no matches and falls back to the full selection. This function
+        intercepts that fall-through by asking the LLM:
+        "which products from this list were recently discussed?"
+
+        Only returns something when specific products were discussed.
+        Returns [] when no context exists (fresh category browse) so the
+        full selection is used — which is correct for a brand-new question.
+
+    Zero hardcoding — fully LLM-driven.
+    """
+    if not session_history:
+        return []
+
+    product_names = [
+        p.get("product_name") or p.get("name") or ""
+        for p in selection
+        if p.get("product_name") or p.get("name")
+    ]
+    if not product_names:
+        return []
+
+    try:
+        response = _ai_client.chat.completions.create(
+            model       = AZURE_OPENAI_DEPLOYMENT,
+            max_tokens  = 120,
+            temperature = 0,
+            messages    = [
+                {"role": "system", "content": (
+                    "From the conversation history, identify which specific products "
+                    "from the list below were most recently discussed, compared, or "
+                    "shown in detail to the customer (e.g. product brief, features, "
+                    "comparison, warranty question).\n\n"
+                    "Return ONLY a JSON array of the exact product names from the list "
+                    "that were recently in focus. Return [] if no specific products "
+                    "were discussed — e.g. customer just browsed the full category "
+                    "without picking anything yet.\n\n"
+                    "Available products:\n"
+                    + "\n".join(f"- {name}" for name in product_names)
+                    + "\n\nReturn ONLY valid JSON array. No explanation, no markdown."
+                )},
+                *session_history[-6:],
+                {"role": "user", "content": "Which products from the list were recently being discussed?"},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            raw = "\n".join(
+                l for l in lines
+                if not l.strip().startswith("```")
+            ).strip()
+        names = json.loads(raw)
+        if not isinstance(names, list):
+            return []
+
+        result = []
+        for name in names:
+            name_lower = name.lower().strip()
+            for p in selection:
+                pname = (p.get("product_name") or p.get("name") or "").lower()
+                if name_lower[:12] in pname or pname[:12] in name_lower:
+                    if p not in result:
+                        result.append(p)
+                    break
+
+        print(f"[FOLLOW-UP] Active context products: {[p.get('product_name') or p.get('name') for p in result]}")
+        return result
+
+    except Exception as e:
+        print(f"[FOLLOW-UP] Active context extraction failed: {e}")
+        return []
+
+
 async def _handle_comparison(incoming, compared: list, session_history: list) -> str:
     """
     Handles comparison of multiple products. Fetches their cached details
@@ -1053,25 +1139,11 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
-    # ── Always parse the follow-up message BEFORE the negotiation check ──────
-    # Previously quick_parsed was only computed when neg_state was active.
-    # This caused a precedence bug: "my budget is low, suggest one with long life"
-    # → is_negotiation_request fired FIRST (saw "budget") → entered negotiation
-    # → is_comparison never ran → wrong response.
-    # Fix: always parse first so is_comparison can act as a gate before negotiation.
-    _t_parse_early = time.monotonic()
-    quick_parsed = await _parse_followup_message(incoming, selection, session_history)
-    print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
-    print(f"[FOLLOW-UP] early parse: {quick_parsed}")
-
-    # If this is a comparison/recommendation question, skip negotiation entirely
-    # and fall through to the comparison handler below.
-    if quick_parsed.get("is_comparison", False):
-        print(f"[FOLLOW-UP] is_comparison=True — bypassing negotiation check")
-        # Jump straight to standard follow-up handling (comparison case)
-        # by skipping all the negotiation logic below.
-        neg_state = None
-    elif neg_state:
+    # Track quick_parsed so it can be reused below instead of re-parsing
+    # the same message a second time if negotiation doesn't fully resolve.
+    quick_parsed = None
+    if neg_state:
+        quick_parsed = await _parse_followup_message(incoming, selection, session_history)
         if quick_parsed.get("is_new_search", False):
             print(f"[NEGOTIATOR] New search — clearing stale negotiation state")
             await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
@@ -1229,8 +1301,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     return result["reply"]
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
-    # quick_parsed is now ALWAYS set above (moved out of the neg_state block)
-    # so we always reuse it here — zero duplicate LLM calls.
+    # PERFORMANCE: reuse quick_parsed from the negotiation check above instead
+    # of calling the LLM again with the exact same input — saves one full
+    # sequential round-trip on every follow-up while negotiation is active.
     if quick_parsed is not None:
         parsed = quick_parsed
         print(f"[FOLLOW-UP] Reusing quick_parsed (skipped duplicate LLM call): {parsed}")
@@ -1317,8 +1390,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         compared_names = []
         if parsed.get("selected_product_name"):
             compared_names.append(parsed["selected_product_name"])
-        # Fall back to comparing all currently shown products if the LLM
-        # didn't extract specific names for a requested comparison.
         compared = []
         if compared_names:
             for name in compared_names:
@@ -1328,9 +1399,84 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     if name_lower in pname or pname in name_lower:
                         compared.append(p)
                         break
+
+        # ── Pronoun resolution ("compare THIS with Nura") ─────────────────
+        # When customer says "compare this with X", only X is extracted by name.
+        # "this" refers to the product currently in context — look it up via
+        # last_discussed_product. If found, pull its full data from product_cache
+        # (not just a bare name stub) so _handle_comparison has complete info.
+        _has_pronoun = False
+        if len(compared) <= 1:
+            try:
+                pronoun_resp = _ai_client.chat.completions.create(
+                    model       = AZURE_OPENAI_DEPLOYMENT,
+                    max_tokens  = 5,
+                    temperature = 0,
+                    messages    = [
+                        {"role": "system", "content": (
+                            "Does this message contain a pronoun or vague reference "
+                            "(like 'this', 'it', 'the current one', 'this product', 'the above') "
+                            "that refers to a product already being discussed, rather than naming "
+                            "the product explicitly?\n"
+                            "Reply ONLY 'YES' or 'NO'."
+                        )},
+                        {"role": "user", "content": incoming.text},
+                    ],
+                )
+                _has_pronoun = "YES" in pronoun_resp.choices[0].message.content.strip().upper()
+            except Exception:
+                _has_pronoun = False
+
+        if _has_pronoun and len(compared) <= 1:
+            try:
+                from db.session_store import get_last_discussed_product
+                _last = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+                if _last:
+                    _last_lower = _last.lower().strip()
+                    _last_p = None
+                    # Try to find in current selection first
+                    for p in selection:
+                        pname = (p.get("product_name") or p.get("name") or "").lower()
+                        if _last_lower[:12] in pname or pname[:12] in _last_lower:
+                            _last_p = p
+                            break
+                    # If not in selection, pull full data from product cache
+                    if _last_p is None:
+                        try:
+                            _cached = await get_cached_product_by_name(incoming.tenant_id, _last)
+                            _last_p = _cached if _cached else {"product_name": _last, "name": _last}
+                        except Exception:
+                            _last_p = {"product_name": _last, "name": _last}
+
+                    already_in = any(
+                        _last_lower[:12] in (p.get("product_name") or p.get("name") or "").lower()
+                        for p in compared
+                    )
+                    if not already_in:
+                        compared.insert(0, _last_p)
+                        print(f"[FOLLOW-UP] Pronoun 'this' resolved to last-discussed: '{_last}'")
+            except Exception as e:
+                print(f"[FOLLOW-UP] Pronoun resolution failed (non-critical): {e}")
+
+        # ── Context-aware fallback ─────────────────────────────────────────
+        # When no products were explicitly named or resolved from pronouns,
+        # check if specific products were recently discussed in this session.
+        # "which is better for budget?" after discussing Juno + Nura → use
+        # [Juno, Nura] not all 18 products.
+        # Only use the full selection when nothing was discussed yet — e.g.
+        # customer just got the category list and immediately asks "which is best?"
         if not compared:
-            compared = selection
-        print(f"[FOLLOW-UP] Comparison mode (by name): {[c.get('product_name') or c.get('name') for c in compared]}")
+            context_products = await _get_active_product_context(
+                incoming, selection, session_history
+            )
+            if context_products:
+                compared = context_products
+                print(f"[FOLLOW-UP] Using recent discussion context for comparison ({len(compared)} products)")
+            else:
+                compared = selection
+                print(f"[FOLLOW-UP] No context found — comparing full selection ({len(compared)} products)")
+
+        print(f"[FOLLOW-UP] Comparison: {[c.get('product_name') or c.get('name') for c in compared]}")
 
         # If user explicitly asked for images, send them
         if asks_for_image:
