@@ -323,6 +323,7 @@ async def process_message(data: dict):
                         graphrag_discount_pct = _ng_disc_pct,
                         session_history       = session_history,
                         negotiation_state     = _resumed,
+                        global_offers         = _pre_neg_state.get("global_offers"),
                     )
                     await save_negotiation_state(
                         incoming.tenant_id, incoming.session_id, _ng_result["state"]
@@ -1047,7 +1048,12 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "image or link resent — even if they already received one before)\n"
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
-                    "a follow-up question or selecting a specific item from the list shown above).\n\n"
+                    "a follow-up question or selecting a specific item from the list shown above).\n"
+                    "- is_offer_inquiry: boolean (true if the user is asking about available offers, discounts, schemes, "
+                    "deals, or store policies — e.g. 'is there any offer?', 'any discount available?', 'what are the offers?', "
+                    "'do you have any scheme?', 'any deal on this?', 'what discounts do you give?', 'tell me about the offers'. "
+                    "Set true ONLY when the customer wants to KNOW about offers, not when they are already negotiating a specific price. "
+                    "Set false if they are asking 'can I get for Rs.X' or 'give me 10% off' — those are negotiations, not inquiries.)\n\n"
                     "CRITICAL: If the assistant's last message asked 'How many units...' or 'how many' and the user replies with a number, "
                     "that number is ALWAYS the quantity.\n"
                     "CRITICAL: A bare number on its own (e.g. customer just types '12') is ALWAYS a quantity, NEVER a product selection. "
@@ -1076,6 +1082,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
             "quantity_unit": None,
             "is_comparison": False,
             "is_recommendation": False,
+            "is_offer_inquiry": False,
             "asks_for_image": False,
             "is_new_search": False
         }
@@ -1282,10 +1289,11 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
     print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
 
-    # is_comparison = True means customer wants a recommendation or comparison —
-    # never a price negotiation. Bypass negotiation entirely.
-    if quick_parsed.get("is_comparison", False) or quick_parsed.get("is_recommendation", False):
-        print(f"[FOLLOW-UP] is_comparison/recommendation=True — bypassing negotiation check")
+    # is_comparison/recommendation/offer_inquiry = never a price negotiation.
+    if (quick_parsed.get("is_comparison", False)
+            or quick_parsed.get("is_recommendation", False)
+            or quick_parsed.get("is_offer_inquiry", False)):
+        print(f"[FOLLOW-UP] is_comparison/recommendation/offer_inquiry=True — bypassing negotiation")
         neg_state = None
     elif neg_state:
         if quick_parsed.get("is_new_search", False):
@@ -1388,6 +1396,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         graphrag_discount_pct  = discount_pct,
                         session_history        = session_history,
                         negotiation_state      = current_state,
+                        global_offers          = cached.get("global_offers"),
                     )
 
                     await save_negotiation_state(
@@ -1530,9 +1539,63 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
+    is_offer_inquiry  = parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
+
+    # ── Case 0: Offer inquiry — show global_offers from cached product ────────
+    # Customer asked "is there any offer?", "any discount?", "what deals?", etc.
+    # Display the real store offers pulled directly from GraphRAG product data.
+    # Zero hardcoding — content comes entirely from global_offers field.
+    if is_offer_inquiry:
+        _offers_text = None
+        # Try to get global_offers from the most recently discussed product
+        for p in selection[:3]:
+            pname = p.get("product_name") or p.get("name")
+            if pname:
+                _cached_p = await get_cached_product_by_name(incoming.tenant_id, pname)
+                _go = (_cached_p or p).get("global_offers")
+                if _go and _go.strip():
+                    _offers_text = _go
+                    break
+
+        if _offers_text:
+            try:
+                _offer_resp = _ai_client.chat.completions.create(
+                    model       = AZURE_OPENAI_DEPLOYMENT,
+                    max_tokens  = 300,
+                    temperature = 0.3,
+                    messages    = [
+                        {"role": "system", "content": (
+                            f"You are a helpful sales assistant for {incoming.biz_name}.\n"
+                            f"The customer {incoming.sender_name} is asking about available offers and discounts.\n"
+                            "Format the store offers below into a clean, friendly WhatsApp message.\n"
+                            "RULES:\n"
+                            "- Show each offer as a bullet point\n"
+                            "- Use *bold* for discount amounts and thresholds\n"
+                            "- Keep it concise and easy to read\n"
+                            "- End with: 'Would you like to place an order to take advantage of these offers?'\n"
+                            "- Do NOT add any offers not present in the data below\n"
+                            "- Do NOT hardcode or invent any discount percentages\n\n"
+                            f"STORE OFFERS DATA:\n{_offers_text}"
+                        )},
+                        {"role": "user", "content": incoming.text},
+                    ],
+                )
+                return _offer_resp.choices[0].message.content.strip()
+            except Exception as _oe:
+                print(f"[FOLLOW-UP] Offer inquiry LLM failed: {_oe}")
+                return (
+                    f"Here are the current offers from {incoming.biz_name}, "
+                    f"{incoming.sender_name}! 🎉\n\n"
+                    + _offers_text.strip()
+                )
+        else:
+            return (
+                f"I don't have specific offer details right now, {incoming.sender_name}. "
+                f"Please browse our products and I can check the best available price for you!"
+            )
 
     # ── Case 1: Comparison OR recommendation ───────────────────────────────
     if is_comparison or is_recommendation:
@@ -2560,9 +2623,3 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Opt
     except Exception as e:
         print(f"[WHATSAPP] Image send error: {e}")
         return None
-
-
-
-
-
-        #
