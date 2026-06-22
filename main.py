@@ -287,7 +287,119 @@ async def process_message(data: dict):
         # NOTE: All product-related messages (browse, info, order, follow-up)
         #       are handled by call_graphrag_api(). The GraphRAG API handles
         #       natural language search, product details, and ordering guidance.
-        if await _is_invoice_inquiry(incoming.text) or await _is_invoice_confirmation_request(incoming, session_history):
+
+        # ── PRE-ROUTE GUARD: awaiting_invoice_confirmation ─────────────────
+        # When the bot has shown an order summary and is waiting for "Confirm",
+        # any message that is NOT a confirmation (e.g. "I want 5890", "can I
+        # get a lower price?", "I need a discount") must re-enter the negotiation
+        # handler — not fall through to UNKNOWN or HUMAN_ESCALATION.
+        #
+        # Without this guard those messages hit intent routing:
+        #   "I want 5890" → UNKNOWN → "I didn't quite understand"  ← confirmed bug
+        #   "I need a discount" → HUMAN_ESCALATION → "team will contact you"
+        _pre_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+        _awaiting_conf = (
+            _pre_neg_state is not None
+            and _pre_neg_state.get("awaiting_invoice_confirmation", False)
+            and _pre_neg_state.get("quantity")
+            and _pre_neg_state.get("last_offer_price")
+        )
+        if _awaiting_conf:
+            _actual_confirm = await _is_invoice_confirmation_request(incoming, session_history)
+            if not _actual_confirm:
+                # Message is not a confirmation — treat as continued negotiation
+                print(f"[NEG GUARD] Message while awaiting confirmation — re-entering negotiation")
+                _ng_product   = _pre_neg_state.get("product_name", "")
+                _ng_price_num = float(_pre_neg_state.get("price_num", 0))
+                _ng_reg_price = float(_pre_neg_state.get("regular_price") or _ng_price_num)
+                _ng_disc_pct  = int(_pre_neg_state.get("graphrag_discount_pct") or 0)
+                if _ng_product and _ng_price_num > 0:
+                    _resumed = {**_pre_neg_state, "awaiting_invoice_confirmation": False}
+                    _ng_result = await handle_negotiation(
+                        incoming              = incoming,
+                        product_name          = _ng_product,
+                        price_num             = _ng_price_num,
+                        regular_price         = _ng_reg_price,
+                        graphrag_discount_pct = _ng_disc_pct,
+                        session_history       = session_history,
+                        negotiation_state     = _resumed,
+                    )
+                    await save_negotiation_state(
+                        incoming.tenant_id, incoming.session_id, _ng_result["state"]
+                    )
+                    if _ng_result["order_ready"] and _ng_result["agreed_price"]:
+                        _a = _ng_result["agreed_price"]
+                        _q = _ng_result["quantity"]
+                        _sub  = round(_a * _q, 2)
+                        _gst  = round(_sub * 0.18, 2)
+                        _tot  = round(_sub * 1.18, 2)
+                        await save_negotiation_state(
+                            incoming.tenant_id, incoming.session_id,
+                            {**_ng_result["state"],
+                             "awaiting_invoice_confirmation": True,
+                             "last_offer_price": _a, "quantity": _q}
+                        )
+                        reply = "\n".join([
+                            f"Here's your updated order summary, {incoming.sender_name}! 🎉",
+                            "",
+                            f"• *Product:* {_ng_product}",
+                            f"• *Quantity:* {_q} units",
+                            f"• *Price per unit:* Rs.{_a:,.0f}",
+                            f"• *Subtotal:* Rs.{_sub:,.0f}",
+                            f"• *GST (18%):* Rs.{_gst:,.0f}",
+                            f"• *Total Payable:* Rs.{_tot:,.0f}",
+                            "",
+                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
+                        ])
+                    else:
+                        reply = _ng_result["reply"]
+                    await update_intent(incoming.message_id, "WORKFLOW_ACTION", 0.95)
+                    sent = await send_whatsapp_reply(incoming.session_id, reply)
+                    if sent:
+                        await save_outbound_message(
+                            tenant_id  = incoming.tenant_id,
+                            session_id = incoming.session_id,
+                            message_id = sent,
+                            text       = reply,
+                        )
+                        await update_reply(
+                            incoming.message_id, reply,
+                            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            None,
+                        )
+                    return
+
+        # ── Fast-path confirmation check ───────────────────────────────────
+        # _is_invoice_confirmation_request() relies on session_history which
+        # is fetched before the outbound order summary is saved — so "Confirm"
+        # would fail the LLM check. Fast-path asks the LLM directly whether
+        # the message is a confirmation, independently of session history.
+        _fast_neg = _pre_neg_state  # reuse — already fetched above
+        _is_fast_confirm = False
+        if _fast_neg is not None and _fast_neg.get("awaiting_invoice_confirmation", False):
+            try:
+                _fc_resp = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _ai_client.chat.completions.create(
+                        model       = AZURE_OPENAI_DEPLOYMENT,
+                        max_tokens  = 5,
+                        temperature = 0,
+                        messages    = [
+                            {"role": "system", "content": (
+                                "The bot just showed an order summary and asked the customer to confirm. "
+                                "Is the customer's message a confirmation to place the order "
+                                "(e.g. 'confirm', 'proceed', 'yes', 'ok', 'sure', 'do it')?\n"
+                                "Reply ONLY 'YES' or 'NO'."
+                            )},
+                            {"role": "user", "content": incoming.text},
+                        ],
+                    )
+                )
+                _is_fast_confirm = "YES" in _fc_resp.choices[0].message.content.strip().upper()
+            except Exception as _fce:
+                print(f"[FAST CONFIRM] LLM check failed: {_fce}")
+
+        if await _is_invoice_inquiry(incoming.text) or _is_fast_confirm or await _is_invoice_confirmation_request(incoming, session_history):
             # Guard: check if there is an active negotiation state first.
             # If yes, customer saying "proceed" should finalize the NEGOTIATED order
             # (not fetch an old order from DB).
