@@ -287,6 +287,101 @@ async def process_message(data: dict):
         # NOTE: All product-related messages (browse, info, order, follow-up)
         #       are handled by call_graphrag_api(). The GraphRAG API handles
         #       natural language search, product details, and ordering guidance.
+
+        # ── PRE-ROUTE GUARD: awaiting_invoice_confirmation ─────────────────
+        # When the bot has shown an order summary and is waiting for "Confirm",
+        # any message that is NOT a confirmation (e.g. "I need more discount",
+        # "can I get a lesser price?", "what about Rs.3,500?") must be sent
+        # BACK into the negotiation handler — not to intent-based routing.
+        #
+        # Without this guard, those messages fall through to:
+        #   • HUMAN_ESCALATION  → "our team will contact you" (wrong — observed in prod)
+        #   • FAQ_KNOWLEDGE     → GraphRAG product search (wrong)
+        #   • GREETING fallback → wrong
+        #
+        # Priority: check this BEFORE _is_invoice_inquiry so a re-negotiation
+        # message is never misread as a confirmation attempt.
+        _pre_route_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+        _is_awaiting_conf = (
+            _pre_route_neg_state is not None
+            and _pre_route_neg_state.get("awaiting_invoice_confirmation", False)
+            and _pre_route_neg_state.get("quantity")
+            and _pre_route_neg_state.get("last_offer_price")
+        )
+        if _is_awaiting_conf:
+            # Check if this IS actually a confirmation — if so, fall through to
+            # the existing invoice-confirmation path below (don't intercept).
+            _is_actual_confirm = await _is_invoice_confirmation_request(incoming, session_history)
+            if not _is_actual_confirm:
+                # Customer is still negotiating after the order summary was shown.
+                # Re-enter the negotiation handler with the existing state.
+                print(f"[NEGOTIATOR] Message received while awaiting confirmation — re-entering negotiation")
+                _neg_product    = _pre_route_neg_state.get("product_name", "")
+                _neg_price_num  = float(_pre_route_neg_state.get("price_num", 0))
+                _neg_reg_price  = float(_pre_route_neg_state.get("regular_price") or _neg_price_num)
+                _neg_disc_pct   = int(_pre_route_neg_state.get("graphrag_discount_pct") or 0)
+                if _neg_product and _neg_price_num > 0:
+                    # Clear the awaiting_confirmation flag so the negotiator
+                    # treats this as a fresh negotiation round
+                    _resumed_state = {
+                        **_pre_route_neg_state,
+                        "awaiting_invoice_confirmation": False,
+                    }
+                    from ai.negotiator import handle_negotiation as _handle_neg
+                    _neg_result = await _handle_neg(
+                        incoming               = incoming,
+                        product_name           = _neg_product,
+                        price_num              = _neg_price_num,
+                        regular_price          = _neg_reg_price,
+                        graphrag_discount_pct  = _neg_disc_pct,
+                        session_history        = session_history,
+                        negotiation_state      = _resumed_state,
+                    )
+                    await save_negotiation_state(
+                        incoming.tenant_id, incoming.session_id, _neg_result["state"]
+                    )
+                    if _neg_result["order_ready"] and _neg_result["agreed_price"]:
+                        agreed  = _neg_result["agreed_price"]
+                        qty     = _neg_result["quantity"]
+                        sub     = round(agreed * qty, 2)
+                        gst     = round(sub * 0.18, 2)
+                        total   = round(sub * 1.18, 2)
+                        updated = {
+                            **_neg_result["state"],
+                            "awaiting_invoice_confirmation": True,
+                            "last_offer_price": agreed,
+                            "quantity": qty,
+                        }
+                        await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated)
+                        lines = [
+                            f"Here's your updated order summary, {incoming.sender_name}! 🎉",
+                            "",
+                            f"• *Product:* {_neg_product}",
+                            f"• *Quantity:* {qty} units",
+                            f"• *Price per unit:* Rs.{agreed:,.0f}",
+                            f"• *Subtotal:* Rs.{sub:,.0f}",
+                            f"• *GST (18%):* Rs.{gst:,.0f}",
+                            f"• *Total Payable:* Rs.{total:,.0f}",
+                            "",
+                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
+                        ]
+                        reply = "\n".join(lines)
+                    else:
+                        reply = _neg_result["reply"]
+                    # Skip all normal routing — negotiation handled it
+                    await update_intent(incoming.message_id, "WORKFLOW_ACTION", 0.95)
+                    await send_whatsapp_message(incoming.phone_number_id, incoming.session_id, reply)
+                    await save_message(
+                        message_id = f"bot_{incoming.message_id}",
+                        session_id = incoming.session_id,
+                        tenant_id  = incoming.tenant_id,
+                        role       = "assistant",
+                        content    = reply,
+                        intent     = "WORKFLOW_ACTION",
+                    )
+                    return
+                # product/price missing from state — fall through to normal routing
+
         if await _is_invoice_inquiry(incoming.text) or await _is_invoice_confirmation_request(incoming, session_history):
             # Guard: check if there is an active negotiation state first.
             # If yes, customer saying "proceed" should finalize the NEGOTIATED order
