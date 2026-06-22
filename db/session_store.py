@@ -669,20 +669,24 @@ async def save_graphrag_product_selection(
 
         items_json_str = json.dumps([
             {
-                "product_name":         p.get("name"),
-                "sku":                  p.get("sku"),
-                "quantity_value":       None,
-                "quantity_unit":        None,
-                "list_price":           float(p.get("price_num", 0)),
-                "regular_price":        p.get("regular_price", p.get("price_num", 0)),
-                "discount_pct":         p.get("discount_percentage", 0),
-                "image_url":            p.get("image_url"),
-                "product_url":          p.get("url"),
-                "rating":               p.get("rating", 0),
-                "review_count":         p.get("review_count", 0),
-                # Keep feature_descriptions from GraphRAG — used for follow-up Q&A
-                # when product_cache has empty features/specs lists
-                "feature_descriptions": p.get("feature_descriptions", ""),
+                "product_name":               p.get("name"),
+                "sku":                        p.get("sku"),
+                "quantity_value":             None,
+                "quantity_unit":              None,
+                "list_price":                 float(p.get("price_num", 0)),
+                "regular_price":              p.get("regular_price", p.get("price_num", 0)),
+                "discount_pct":               p.get("discount_percentage", 0),
+                "image_url":                  p.get("image_url"),
+                "product_url":                p.get("url"),
+                "rating":                     p.get("rating", 0),
+                "review_count":               p.get("review_count", 0),
+                "feature_descriptions":       p.get("feature_descriptions", ""),
+                # global_offers — store-wide value-based discount tiers.
+                # Used by the negotiator to offer REAL discounts based on
+                # order value instead of hardcoded quantity tiers.
+                "global_offers":              p.get("global_offers", ""),
+                "warranty":                   p.get("warranty", ""),
+                "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
             }
             for p in products
         ])
