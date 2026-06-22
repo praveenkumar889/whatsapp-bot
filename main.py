@@ -489,7 +489,12 @@ async def process_message(data: dict):
                     if prompt:
                         reply = f"{reply}\n\n{prompt}"
         elif result.intent == "HUMAN_ESCALATION":
-            reply = await handle_escalation(incoming)
+            _esc_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+            if _esc_neg_state and _esc_neg_state.get("product_name"):
+                print(f"[ESCALATION] Active negotiation — redirecting to negotiation handler")
+                reply = await call_graphrag_api(incoming, session_history)
+            else:
+                reply = await handle_escalation(incoming)
         elif result.intent == "GREETING":
             reply = await handle_greeting(incoming)
         else:
@@ -836,9 +841,9 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
         # Store raw response on incoming so pipeline can save it to DB
         import json as _json
         try:
-            incoming._graphrag_raw = _json.dumps(data, ensure_ascii=False)[:10000]
+            incoming._graphrag_raw = _json.dumps(data, ensure_ascii=False)
         except Exception:
-            incoming._graphrag_raw = str(data)[:10000]
+            incoming._graphrag_raw = str(data)
 
         response_text = data.get("response_text", [])
         response_text = _coerce_pythonic_dict(response_text)
@@ -1024,17 +1029,18 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "a product selection, it is always a quantity or unrelated number. Do not try to match bare numbers to list positions.\n"
                     "- quantity: integer or null (e.g. '1 unit' → 1, 'order 5' → 5, or a bare number like '12' when no product name is given → 12)\n"
                     "- quantity_unit: string or null (e.g. 'units', 'pieces', 'kg')\n"
-                    "- is_comparison: boolean (true if user asks to compare, choose between, or get a recommendation "
-                    "from the products currently shown — either by naming them explicitly, OR by asking a general "
-                    "selection/recommendation question such as: 'which is better', 'which is cheaper', "
-                    "'which is best for limited budget', 'which should I choose', 'which one is more durable', "
-                    "'what is the difference', 'which one would you recommend', 'suggest me one', "
-                    "'recommend one for me', 'which one should I buy', 'which fits my budget', "
-                    "'suggest me one based on budget and durability' — any question implying the customer "
-                    "wants help picking ONE product from the list shown, even without naming products. "
-                    "Set true even when only 1 product has been discussed so far, as long as the customer "
-                    "is asking for a recommendation from the full list. Set false ONLY if the customer is "
-                    "asking a follow-up question about a specific product's features/price/order.)\n"
+                    "- is_comparison: boolean (true ONLY if the user explicitly asks to COMPARE two or more "
+                    "products side by side — e.g. 'compare this with X', 'compare Romy and Electra', "
+                    "'what is the difference between X and Y', 'compare these two'. "
+                    "The customer wants a side-by-side table of features. "
+                    "Set false for recommendation/suggestion questions.)\n"
+                    "- is_recommendation: boolean (true if the user asks for a recommendation or wants help "
+                    "picking ONE product — e.g. 'which is better', 'which should I choose', "
+                    "'suggest me one', 'recommend one for me', 'which fits my budget', "
+                    "'which is best for low budget and high durability', 'which one would you recommend', "
+                    "'which is cheaper', 'which one is more durable', 'suggest me one based on budget'. "
+                    "The customer wants ONE product picked for them, not a side-by-side table. "
+                    "Set false if the customer explicitly asked to compare products side by side.)\n"
                     "- asks_for_image: boolean (true if user asks to see/get/share a picture, image, photo, visual, "
                     "installation guide, installation steps, installation link, or asks 'where is the link', "
                     "'send me the link/guide', 'can you share it', or any request implying they want the actual "
@@ -1069,6 +1075,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
             "quantity": None,
             "quantity_unit": None,
             "is_comparison": False,
+            "is_recommendation": False,
             "asks_for_image": False,
             "is_new_search": False
         }
@@ -1149,12 +1156,16 @@ async def _get_active_product_context(
         return []
 
 
-async def _handle_comparison(incoming, compared: list, session_history: list) -> str:
+async def _handle_comparison(
+    incoming,
+    compared: list,
+    session_history: list,
+    show_recommendation: bool = False,
+) -> str:
     """
-    Handles comparison of multiple products. Fetches their cached details
-    and asks LLM to compare them side-by-side.
+    show_recommendation=False → comparison only (side-by-side, no recommendation)
+    show_recommendation=True  → recommendation only (pick one, no table)
     """
-    # Gather product contexts
     products_data = []
     for p in compared:
         pname = p.get("product_name") or p.get("name")
@@ -1164,15 +1175,27 @@ async def _handle_comparison(incoming, compared: list, session_history: list) ->
         else:
             products_data.append(p)
 
-    # Use LLM to generate comparison
-    try:
-        response = _ai_client.chat.completions.create(
-            model       = AZURE_OPENAI_DEPLOYMENT,
-            max_tokens  = 600,
-            temperature = 0.3,
-            messages    = [
-                {"role": "system", "content": f"""You are a helpful WhatsApp assistant for {incoming.biz_name}.
-The customer wants to compare multiple products.
+    if show_recommendation:
+        system_prompt = f"""You are a helpful WhatsApp assistant for {incoming.biz_name}.
+The customer wants a recommendation — pick the BEST product for them based on their criteria.
+Do NOT show a side-by-side comparison table.
+
+FORMAT:
+- Start with: "*[Product Name]* is the best choice for you, {incoming.sender_name}, because..."
+- Give 2-3 short bullet points explaining why it fits their criteria
+- End with: "Would you like to order it or know more details?"
+
+RULES:
+- Be direct — pick ONE product only
+- Do NOT list all products side by side
+- Do NOT add a Comparison section
+
+PRODUCTS TO CONSIDER:
+{json.dumps(products_data, indent=2)}
+"""
+    else:
+        system_prompt = f"""You are a helpful WhatsApp assistant for {incoming.biz_name}.
+The customer wants a side-by-side comparison.
 
 FORMAT RULES — CRITICAL:
 - NEVER use markdown tables (no | pipes, no --- dashes). WhatsApp does not render tables.
@@ -1185,32 +1208,31 @@ FORMAT RULES — CRITICAL:
   • [Key feature 3]
   • Best for: [use case]
 
-*2. [Product Name]*
-  • Price: Rs.X,XXX (Y% off Rs.Z,ZZZ)
-  • [Key feature 1]
-  • [Key feature 2]
-  • [Key feature 3]
-  • Best for: [use case]
-
-Then add a short *Recommendation* line at the end.
-
 RULES:
 - Address the customer as {incoming.sender_name}
-- Use *bold* only for product names and the Recommendation label
+- Use *bold* only for product names
 - Max 5 bullet points per product
-- Keep each bullet short (one line)
+- Do NOT add a Recommendation section
 - End with: "Let me know which one you'd like or if you need more details!"
 
 PRODUCTS TO COMPARE:
 {json.dumps(products_data, indent=2)}
-"""},
+"""
+
+    try:
+        response = _ai_client.chat.completions.create(
+            model       = AZURE_OPENAI_DEPLOYMENT,
+            max_tokens  = 600,
+            temperature = 0.3,
+            messages    = [
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": incoming.text},
             ],
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[FOLLOW-UP] Comparison LLM failed: {e}")
-        return "I had trouble comparing those products right now. Which one would you like to know more about?"
+        print(f"[FOLLOW-UP] Comparison/recommendation LLM failed: {e}")
+        return "I had trouble with that right now. Which product would you like to know more about?"
 
 
 async def _try_resolve_product_followup(incoming, session_history: list):
@@ -1262,8 +1284,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     # is_comparison = True means customer wants a recommendation or comparison —
     # never a price negotiation. Bypass negotiation entirely.
-    if quick_parsed.get("is_comparison", False):
-        print(f"[FOLLOW-UP] is_comparison=True — bypassing negotiation check")
+    if quick_parsed.get("is_comparison", False) or quick_parsed.get("is_recommendation", False):
+        print(f"[FOLLOW-UP] is_comparison/recommendation=True — bypassing negotiation check")
         neg_state = None
     elif neg_state:
         if quick_parsed.get("is_new_search", False):
@@ -1417,6 +1439,14 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     if result["escalate"]:
                         await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+                    import json as _j
+                    incoming._graphrag_raw = _j.dumps({
+                        "handler": "negotiation",
+                        "product": product_name,
+                        "rounds": result["state"].get("rounds"),
+                        "agreed_price": result.get("agreed_price"),
+                        "order_ready": result.get("order_ready"),
+                    })
                     return result["reply"]
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
@@ -1498,13 +1528,14 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # has been REMOVED entirely. It was unreliable on long product lists
     # (90+ items) and collided with quantity parsing ("57" meaning 57 units).
     # Customers must now select products by NAME only.
-    is_comparison = parsed.get("is_comparison", False)
-    asks_for_image = parsed.get("asks_for_image", False)
+    is_comparison     = parsed.get("is_comparison", False)
+    is_recommendation = parsed.get("is_recommendation", False)
+    asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
 
-    # ── Case 1: Comparison / recommendation ────────────────────────────────
-    if is_comparison:
+    # ── Case 1: Comparison OR recommendation ───────────────────────────────
+    if is_comparison or is_recommendation:
         compared_names = []
         if parsed.get("selected_product_name"):
             compared_names.append(parsed["selected_product_name"])
@@ -1640,7 +1671,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             original_type = "image",
                         )
 
-        return await _handle_comparison(incoming, compared, session_history)
+        import json as _j
+        incoming._graphrag_raw = _j.dumps({
+            "handler": "comparison" if is_comparison else "recommendation",
+            "products": [p.get("product_name") or p.get("name") for p in compared[:5]],
+        })
+        return await _handle_comparison(
+            incoming, compared, session_history,
+            show_recommendation=is_recommendation,
+        )
 
     # ── Case 2: Name match ──────────────────────────────────────────────────
     # Check if LLM parsed a specific product name first
@@ -2000,6 +2039,13 @@ PRODUCT DATA:
         reply = response.choices[0].message.content.strip()
         print(f"[TIMING] Final answer LLM call: {time.monotonic() - _t_final_start:.2f}s")
         print(f"[FOLLOW-UP] LLM answered for product '{product_name}'")
+
+        import json as _j
+        incoming._graphrag_raw = _j.dumps({
+            "handler": "product_followup",
+            "product": product_name,
+            "quantity": parsed_qty,
+        })
 
         # Save pending order to DB if quantity is specified
         if parsed_qty is not None:
@@ -2514,3 +2560,9 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Opt
     except Exception as e:
         print(f"[WHATSAPP] Image send error: {e}")
         return None
+
+
+
+
+
+        #
