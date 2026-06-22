@@ -888,8 +888,11 @@ async def save_last_discussed_product(
     """Saves the last discussed product name in workflow_sessions table."""
     try:
         now_utc    = datetime.now(timezone.utc)
-        # Expires in 24 hours (long duration)
-        expires_at = (now_utc + timedelta(hours=24)).isoformat()
+        # 30 minutes — long enough to cover a natural conversation, short enough
+        # to prevent a product from a previous session poisoning a new one.
+        # (Was 24 hours — caused "Zenia SKY" to appear when customer asked
+        # "which is better?" about Romy/Electra in a brand-new session.)
+        expires_at = (now_utc + timedelta(minutes=30)).isoformat()
         row = {
             "tenant_id":      tenant_id,
             "session_id":     session_id,
