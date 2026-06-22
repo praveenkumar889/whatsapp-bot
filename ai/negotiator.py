@@ -6,22 +6,17 @@
 #   2. Customer asks for a discount
 #   3. Bot asks: "How many units are you looking to buy?"
 #   4. Customer replies with quantity
-#   5. Bot applies tier discount on price_num (NOT regular_price):
-#        1–4  units → 0%  off price_num (no extra discount)
-#        5–9  units → 5%  off price_num
-#        10–14 units → 10% off price_num
-#        ≥15  units → 15% off price_num  ← also the floor_price
+#   5. Bot calculates offer based on REAL global_offers value tiers (from GraphRAG):
+#        order ≥ Rs 2,500  → 2% extra off price_num
+#        order ≥ Rs 7,500  → 5% extra off price_num
+#        order ≥ Rs 14,500 → 8% extra off price_num
+#      (tiers are parsed from global_offers field — zero hardcoding)
 #   6. Customer can counter-offer (max 3 rounds)
-#   7. Customer accepts → order summary → "Reply Proceed to confirm"
-#   8. Customer says Proceed → create_order() + invoice
+#   7. Customer accepts → order summary → "Reply Confirm to place order"
+#   8. Customer says Confirm → create_order() + invoice
 #
-# HARDCODED (intentionally — these are fixed business rules):
-#   - Tier thresholds: 5, 10, 15
-#   - Tier discounts:  5%, 10%, 15%
-#   - Floor multiplier: 0.85 (15% off price_num)
-#   - Max rounds: 3
-#
-# ZERO HARDCODING of:
+# ZERO HARDCODING:
+#   - Tier thresholds and discounts come from global_offers (parsed via LLM)
 #   - Business names, product names, prices (all from DB/GraphRAG)
 #   - Customer names (from incoming object)
 #   - Reply messages (all LLM-generated)
@@ -44,73 +39,153 @@ _client = AzureOpenAI(
     max_retries    = 0,
 )
 
-# ── Business rules — correctly hardcoded ──────────────────────────────────────
+# ── Business rules ────────────────────────────────────────────────────────────
 MAX_NEGOTIATION_ROUNDS = 3
-FLOOR_MULTIPLIER       = 0.85   # floor_price = price_num × 0.85
+FLOOR_MULTIPLIER       = 0.92   # fallback floor when no global_offers tiers found
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TIER LOGIC
+# GLOBAL OFFER TIER LOGIC  (replaces hardcoded get_tier_discount)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_tier_discount(quantity: int) -> float:
+def parse_global_offer_tiers(global_offers: str) -> list:
     """
-    Returns extra discount % based on quantity.
-    Applied on price_num (GraphRAG discounted price) — NOT on regular_price.
+    Parses the global_offers string from GraphRAG into sorted
+    [(min_order_value, discount_pct), ...] tuples.
 
-    Tiers (business rules — hardcoded intentionally):
-        1–4   → 0.00  (no extra discount)
-        5–9   → 0.05  (5% off)
-        10–14 → 0.10  (10% off)
-        ≥15   → 0.15  (15% off) ← same as floor
+    Example input:
+        "Extra 2% OFF | Rs 2500 : ..."
+        "Extra 5% OFF | Rs 7500 : ..."
+        "Extra 8% OFF | Rs 14500 : ..."
+
+    Returns:
+        [(2500, 2), (7500, 5), (14500, 8)]
+
+    LLM-driven — zero regex or format hardcoding.
+    Falls back to [] if parsing fails.
     """
-    if quantity >= 15:
-        return 0.15
-    elif quantity >= 10:
-        return 0.10
-    elif quantity >= 5:
-        return 0.05
+    if not global_offers or not global_offers.strip():
+        return []
+    try:
+        response = _client.chat.completions.create(
+            model       = AZURE_OPENAI_DEPLOYMENT,
+            max_tokens  = 150,
+            temperature = 0,
+            messages    = [
+                {"role": "system", "content": (
+                    "Extract discount tiers from the store offers text.\n"
+                    "Return ONLY a JSON array of [min_order_value, discount_pct] pairs.\n"
+                    "Example: [[2500, 2], [7500, 5], [14500, 8]]\n"
+                    "Sort ascending by min_order_value.\n"
+                    "Return [] if no value-based discount tiers found.\n"
+                    "Reply with ONLY the JSON array, nothing else."
+                )},
+                {"role": "user", "content": global_offers},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, list) and all(len(t) == 2 for t in parsed):
+            return sorted(parsed, key=lambda x: x[0])
+        return []
+    except Exception as e:
+        print(f"[NEGOTIATOR] parse_global_offer_tiers failed: {e}")
+        return []
+
+
+def get_applicable_tier(order_value: float, tiers: list) -> tuple:
+    """
+    Returns the (min_value, discount_pct) tier that applies to the
+    current order value, or (0, 0) if no tier is reached.
+
+    Example: order_value=8000, tiers=[(2500,2),(7500,5),(14500,8)]
+    → (7500, 5)  because order >= Rs 7,500
+    """
+    applicable = (0, 0)
+    for min_val, disc_pct in tiers:
+        if order_value >= min_val:
+            applicable = (min_val, disc_pct)
+        else:
+            break
+    return applicable
+
+
+def get_next_tier(order_value: float, tiers: list) -> Optional[tuple]:
+    """
+    Returns the next tier the customer can unlock, or None if at max.
+
+    Example: order_value=8000, tiers=[(2500,2),(7500,5),(14500,8)]
+    → (14500, 8)  — next tier requires Rs 14,500
+    """
+    for min_val, disc_pct in tiers:
+        if order_value < min_val:
+            return (min_val, disc_pct)
+    return None
+
+
+def calculate_offer(price_num: float, quantity: int, tiers: list = None) -> dict:
+    """
+    Calculates offer price and floor using real global_offers tiers.
+
+    REPLACES hardcoded quantity tiers (5/10/15 units → 5/10/15% off).
+
+    Logic:
+        order_value = price_num × quantity
+        current_disc = applicable global offer tier discount %
+        max_disc     = highest global offer tier discount %
+        floor_price  = price_num × (1 - max_disc/100)   ← best possible price
+        offer_price  = midpoint(price_num, floor_price)  ← starting offer
+
+    If no tiers found (global_offers unavailable):
+        floor_price  = price_num × FLOOR_MULTIPLIER
+        offer_price  = price_num  (no extra discount)
+    """
+    tiers       = tiers or []
+    order_value = price_num * quantity
+
+    if not tiers:
+        # No global offer data — no extra discount possible
+        return {
+            "offer_price":       price_num,
+            "total_price":       round(price_num * quantity, 2),
+            "floor_price":       round(price_num * FLOOR_MULTIPLIER, 2),
+            "tier_discount_pct": 0,
+            "has_discount":      False,
+            "price_num":         price_num,
+            "quantity":          quantity,
+            "order_value":       order_value,
+            "tiers":             tiers,
+            "current_tier_disc": 0,
+            "max_tier_disc":     0,
+        }
+
+    _, current_disc = get_applicable_tier(order_value, tiers)
+    max_disc        = max(d for _, d in tiers)
+
+    floor_price = round(price_num * (1 - max_disc / 100), 2)
+
+    if current_disc > 0:
+        # Already qualifies for a tier — offer current tier, floor is max tier
+        current_off = round(price_num * (1 - current_disc / 100), 2)
+        offer_price = round((price_num + current_off) / 2, 2)
+        offer_price = max(offer_price, floor_price)  # never below floor
     else:
-        return 0.00
-
-
-def calculate_offer(price_num: float, quantity: int) -> dict:
-    """
-    Calculates the first offer price and floor price for a given quantity.
-
-    KEY DESIGN — negotiation room:
-        Floor  = tier price (best we can do for this quantity, never revealed upfront)
-        Offer  = midway between price_num and floor (starting point for negotiation)
-
-        Example (price_num=Rs.789, quantity=10, tier=10%):
-            floor  = Rs.789 × 0.90 = Rs.710  ← minimum, not shown first
-            offer  = (Rs.789 + Rs.710) / 2   = Rs.750  ← shown to customer first
-
-        Customer negotiates Rs.750 → Rs.730 → Rs.710 (floor, final offer)
-        This feels like a real negotiation — not a price list.
-    """
-    tier_discount = get_tier_discount(quantity)
-
-    if tier_discount == 0:
-        floor_price = price_num
-        offer_price = price_num
-    else:
-        # Floor = best possible price for this tier
-        floor_price = round(price_num * (1 - tier_discount), 2)
-        # Start offer midway — gives 2-3 rounds of negotiation room
-        offer_price = round((price_num + floor_price) / 2, 2)
-
-    total_price       = round(offer_price * quantity, 2)
-    tier_discount_pct = int(tier_discount * 100)
+        # Doesn't qualify for any tier yet — offer a small starter discount
+        offer_price = round(price_num * 0.99, 2)     # 1% off as opener
+        offer_price = max(offer_price, floor_price)
 
     return {
         "offer_price":       offer_price,
-        "total_price":       total_price,
+        "total_price":       round(offer_price * quantity, 2),
         "floor_price":       floor_price,
-        "tier_discount_pct": tier_discount_pct,
-        "has_discount":      tier_discount > 0,
+        "tier_discount_pct": current_disc,
+        "has_discount":      current_disc > 0 or max_disc > 0,
         "price_num":         price_num,
         "quantity":          quantity,
+        "order_value":       order_value,
+        "tiers":             tiers,
+        "current_tier_disc": current_disc,
+        "max_tier_disc":     max_disc,
     }
 
 
@@ -423,8 +498,24 @@ async def _reply_no_discount(
     discount_pct: int,
     quantity: int,
     biz_name: str,
+    tiers: list = None,
 ) -> str:
-    """Tells customer no extra discount for < 5 units but mentions how to qualify."""
+    """Tells customer current order doesn't qualify for extra discount yet, with real tier upsell."""
+    order_value = price_num * quantity
+    tiers       = tiers or []
+    next_t      = get_next_tier(order_value, tiers) if tiers else None
+
+    if next_t:
+        units_needed = max(1, int((next_t[0] - order_value) / price_num) + 1)
+        upsell = (
+            f"Order {units_needed} more unit(s) to reach Rs.{next_t[0]:,} "
+            f"and unlock {next_t[1]}% extra off automatically at checkout!"
+        )
+    elif tiers:
+        upsell = f"Your order already qualifies for the best available discount!"
+    else:
+        upsell = "This product is already at our best available price."
+
     try:
         response = _client.chat.completions.create(
             model       = AZURE_OPENAI_DEPLOYMENT,
@@ -433,11 +524,12 @@ async def _reply_no_discount(
             messages    = [
                 {"role": "system", "content": (
                     f"You are a friendly sales assistant for {biz_name}.\n"
-                    f"Customer wants {quantity} unit(s) of *{product_name}*.\n"
+                    f"Customer wants {quantity} unit(s) of *{product_name}* "
+                    f"(order value: Rs.{order_value:,.0f}).\n"
                     f"Current price: Rs.{price_num:,.0f} (already {discount_pct}% off Rs.{regular_price:,.0f})\n"
-                    "For orders below 5 units, no additional discount is available.\n"
-                    "However, mention that buying 5+ units qualifies for extra discounts.\n"
-                    "Be warm, honest, and helpful. Max 4 lines.\n"
+                    f"Their order value doesn't yet qualify for extra store discounts.\n"
+                    f"Upsell tip: {upsell}\n"
+                    "Be warm, honest. Max 4 lines.\n"
                     f"Address customer as {sender}. Use *bold* for prices."
                 )},
                 {"role": "user", "content": "Give the no-discount response."},
@@ -450,7 +542,7 @@ async def _reply_no_discount(
         return (
             f"{sender}, for {quantity} unit(s) the price is *Rs.{price_num:,.0f}* per unit "
             f"(Total: *Rs.{total:,.0f}*).\n\n"
-            f"💡 Buy 5+ units to unlock extra discounts!\n\n"
+            f"💡 {upsell}\n\n"
             f"Would you like to proceed at this price?"
         )
 
@@ -464,37 +556,49 @@ async def _reply_first_offer(
     offer: dict,
     biz_name: str,
 ) -> str:
-    """Presents the tier-based first offer to the customer."""
+    """Presents value-based first offer with real global offer tier upsell hint."""
     try:
-        # Actual % off price_num for this starting offer (not the tier %)
         actual_offer_pct = round((1 - offer["offer_price"] / price_num) * 100, 1) if price_num > 0 else 0
+        order_value      = offer.get("order_value", price_num * offer["quantity"])
+        tiers            = offer.get("tiers", [])
+        next_t           = get_next_tier(order_value, tiers) if tiers else None
+
+        upsell_hint = ""
+        if next_t:
+            units_needed = max(1, int((next_t[0] - order_value) / price_num) + 1)
+            upsell_hint = (
+                f"\nUpsell (include naturally if appropriate): "
+                f"Order {units_needed} more unit(s) to reach Rs.{next_t[0]:,} "
+                f"and unlock {next_t[1]}% extra off automatically at checkout."
+            )
 
         context = (
             f"Product: {product_name}\n"
             f"Regular price: Rs.{regular_price:,.0f}\n"
             f"Already discounted price: Rs.{price_num:,.0f} ({graphrag_discount_pct}% off)\n"
-            f"Customer quantity: {offer['quantity']} units\n"
-            f"Offer price: Rs.{offer['offer_price']:,.0f} per unit ({actual_offer_pct}% extra off Rs.{price_num:,.0f})\n"
-            f"Total for {offer['quantity']} units: Rs.{offer['total_price']:,.0f}\n"
-            f"IMPORTANT: Do NOT say '{offer['tier_discount_pct']}% off' — that is internal, not the offer %."
+            f"Customer quantity: {offer['quantity']} units | Order value: Rs.{order_value:,.0f}\n"
+            f"Offer price: Rs.{offer['offer_price']:,.0f}/unit ({actual_offer_pct}% extra off)\n"
+            f"Total: Rs.{offer['total_price']:,.0f}\n"
+            f"{upsell_hint}"
         )
         response = _client.chat.completions.create(
             model       = AZURE_OPENAI_DEPLOYMENT,
-            max_tokens  = 200,
+            max_tokens  = 220,
             temperature = 0.4,
             messages    = [
                 {"role": "system", "content": (
                     f"You are a friendly sales assistant for {biz_name}.\n"
-                    "Present a quantity-based price offer to the customer.\n"
-                    "MUST show all 3 prices clearly:\n"
+                    "Present a price offer based on the customer's order value.\n"
+                    "MUST show clearly:\n"
                     "  1. Original price (regular_price)\n"
                     "  2. Already discounted price (price_num) with its % off\n"
-                    f"  3. Final offer price with the EXACT extra discount % ({actual_offer_pct}% extra off)\n"
-                    "ALWAYS include the discount percentage next to the final price.\n"
-                    "Example format: *Rs.X* per unit (*Y% extra off*)\n"
-                    "Be warm and concise (max 6 lines). Use *bold* for prices and percentages.\n"
+                    f"  3. Your offer price with exact discount % ({actual_offer_pct}% extra off)\n"
+                    "  4. Total order value\n"
+                    "Example: *Rs.X* per unit (*Y% extra off*)\n"
+                    "If upsell hint is provided, mention it naturally once.\n"
+                    "Be warm. Max 7 lines. Use *bold* for prices.\n"
                     "End with: 'Would you like to proceed at this price?'\n"
-                    f"Address customer as {sender}. Do NOT reveal the floor price.\n\n"
+                    f"Address as {sender}. Do NOT reveal the floor price.\n\n"
                     f"OFFER DETAILS:\n{context}"
                 )},
                 {"role": "user", "content": "Present the offer."},
@@ -508,7 +612,7 @@ async def _reply_first_offer(
             f"For *{offer['quantity']} units* of *{product_name}*:\n"
             f"• Regular price: Rs.{regular_price:,.0f}\n"
             f"• Our price: Rs.{price_num:,.0f} ({graphrag_discount_pct}% off)\n"
-            f"• Your price ({actual_offer_pct}% extra off): *Rs.{offer['offer_price']:,.0f}* per unit\n"
+            f"• Your price ({actual_offer_pct}% extra off): *Rs.{offer['offer_price']:,.0f}*/unit\n"
             f"• Total: *Rs.{offer['total_price']:,.0f}*\n\n"
             f"Would you like to proceed at this price?"
         )
@@ -683,68 +787,58 @@ async def _reply_escalate(
 
 async def handle_negotiation(
     incoming,
-    product_name:      str,
-    price_num:         float,
-    regular_price:     float,
+    product_name:          str,
+    price_num:             float,
+    regular_price:         float,
     graphrag_discount_pct: int,
-    session_history:   list,
-    negotiation_state: dict,
+    session_history:       list,
+    negotiation_state:     dict,
+    global_offers:         str = None,
 ) -> dict:
     """
-    Core negotiation handler called from main.py.
+    Core negotiation handler. Uses real global_offers value tiers instead of
+    hardcoded quantity tiers.
 
     Args:
-        incoming:              IncomingMessage object
-        product_name:          Product being negotiated
-        price_num:             GraphRAG discounted price (e.g. Rs.2,653)
-        regular_price:         Original price before GraphRAG discount (e.g. Rs.3,538)
-        graphrag_discount_pct: GraphRAG's already-applied discount % (e.g. 25)
-        session_history:       Last N messages for LLM context
-        negotiation_state:     Current state from DB:
-            {
-                "rounds":           int,    # negotiation rounds so far
-                "quantity":         int,    # units customer wants (None until provided)
-                "last_offer_price": float,  # last price we offered
-                "floor_price":      float,  # absolute minimum
-                "product_name":     str,
-                "price_num":        float,
-                "awaiting_quantity": bool,  # True if we asked for units and waiting
-            }
-
-    Returns dict:
-        "reply":        str            — message to send customer
-        "state":        dict           — updated state to save to DB
-        "order_ready":  bool           — True if customer accepted → trigger order
-        "escalate":     bool           — True → escalate to human
-        "agreed_price": float | None   — final agreed price per unit
-        "quantity":     int | None     — confirmed quantity
+        global_offers: Store-wide offer text from GraphRAG product data.
+                       "Extra 2% OFF | Rs 2500 ... Extra 5% OFF | Rs 7500..."
+                       Parsed to real discount tiers — zero hardcoding.
     """
-    msg          = incoming.text
-    sender       = incoming.sender_name
-    biz_name     = incoming.biz_name
-    rounds       = negotiation_state.get("rounds", 0)
-    quantity     = negotiation_state.get("quantity")
+    msg      = incoming.text
+    sender   = incoming.sender_name
+    biz_name = incoming.biz_name
+    rounds   = negotiation_state.get("rounds", 0)
+    quantity = negotiation_state.get("quantity")
     had_existing_quantity = bool(quantity)
-    # Floor MUST be calculated from actual quantity tier — never use fixed multiplier.
-    # 10 units → tier=10% → floor=Rs.710 (not Rs.671 which is 15% tier)
-    # Recalculate from quantity every time to prevent stale state bugs.
+
+    # ── Parse global offer tiers — cached in state to avoid re-parsing ────────
+    _cached_tiers = negotiation_state.get("_tiers")
+    if _cached_tiers is not None:
+        tiers = _cached_tiers
+    elif global_offers:
+        tiers = parse_global_offer_tiers(global_offers)
+        print(f"[NEGOTIATOR] Parsed tiers: {tiers}")
+    else:
+        tiers = []
+
+    # ── Floor price from real tiers ───────────────────────────────────────────
     _saved_floor = negotiation_state.get("floor_price")
-    if quantity and _saved_floor:
-        # Verify saved floor matches current quantity tier
-        _expected_floor = round(price_num * (1 - get_tier_discount(quantity)), 2)
-        floor_price = _expected_floor  # always use tier-based floor
-    elif quantity:
-        floor_price = round(price_num * (1 - get_tier_discount(quantity)), 2)
+    if tiers:
+        max_disc    = max(d for _, d in tiers)
+        floor_price = round(price_num * (1 - max_disc / 100), 2)
     else:
         floor_price = _saved_floor or round(price_num * FLOOR_MULTIPLIER, 2)
+
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
     def _updated_state(**kwargs) -> dict:
         return {
             **negotiation_state,
-            "product_name":     product_name,
-            "price_num":        price_num,
-            "floor_price":      floor_price,
+            "product_name":  product_name,
+            "price_num":     price_num,
+            "floor_price":   floor_price,
+            "global_offers": global_offers,
+            "_tiers":        tiers,   # cache — avoid re-parsing every turn
             **kwargs,
         }
 
@@ -753,7 +847,6 @@ async def handle_negotiation(
         quantity = await extract_quantity(msg, product_name, session_history)
 
         if not quantity:
-            # Customer didn't give a number — ask again
             reply = (
                 f"I didn't catch that, {sender}. "
                 f"How many units of *{product_name}* would you like to buy?"
@@ -767,14 +860,14 @@ async def handle_negotiation(
                 "quantity":     None,
             }
 
-        # Got quantity — check if it qualifies for any discount
-        offer = calculate_offer(price_num, quantity)
+        # Got quantity — calculate offer using real global offer tiers
+        offer = calculate_offer(price_num, quantity, tiers)
 
         if not offer["has_discount"]:
             # Less than 5 units — no extra discount
             reply = await _reply_no_discount(
                 sender, product_name, price_num, regular_price,
-                graphrag_discount_pct, quantity, biz_name
+                graphrag_discount_pct, quantity, biz_name, tiers
             )
             return {
                 "reply":        reply,
@@ -877,14 +970,15 @@ async def handle_negotiation(
         if new_quantity:
             print(f"[NEGOTIATOR] Quantity change detected: {quantity} -> {new_quantity}")
             quantity    = new_quantity
-            floor_price = round(price_num * (1 - get_tier_discount(quantity)), 2)
-            offer       = calculate_offer(price_num, quantity)
+            max_disc    = max((d for _, d in tiers), default=0) if tiers else int((1 - FLOOR_MULTIPLIER) * 100)
+            floor_price = round(price_num * (1 - max_disc / 100), 2)
+            offer       = calculate_offer(price_num, quantity, tiers)
             rounds     += 1
 
             if not offer["has_discount"]:
                 reply = await _reply_no_discount(
                     sender, product_name, price_num, regular_price,
-                    graphrag_discount_pct, quantity, biz_name
+                    graphrag_discount_pct, quantity, biz_name, tiers
                 )
                 return {
                     "reply":        reply,
@@ -950,31 +1044,27 @@ async def handle_negotiation(
 
     # ── Step 4: Check for counter-offer or "more discount" request ───────────
     if rounds > 0:
-        # First check: customer asking for more discount without a specific price
-        # e.g. "any more discount more than 10%?" "can you do better?"
         if await detect_more_discount_request(msg, session_history):
-            last_offer    = negotiation_state.get("last_offer_price", price_num)
-            tier_discount = get_tier_discount(quantity)
-            tier_pct      = int(tier_discount * 100)
+            last_offer   = negotiation_state.get("last_offer_price", price_num)
+            order_value  = price_num * quantity
+            _, cur_disc  = get_applicable_tier(order_value, tiers) if tiers else (0, 0)
+            max_disc_all = max((d for _, d in tiers), default=0) if tiers else 0
+            already_at_floor = round(last_offer, 2) <= round(floor_price, 2)
 
-            # Floor is always recalculated from quantity tier — never trust saved value
-            floor_price   = round(price_num * (1 - tier_discount), 2)
+            # Build real upsell hint from global offer tiers
+            next_t = get_next_tier(order_value, tiers) if tiers else None
+            if next_t:
+                units_needed  = max(1, int((next_t[0] - order_value) / price_num) + 1)
+                next_tier_msg = (
+                    f"order {units_needed} more unit(s) to reach "
+                    f"Rs.{next_t[0]:,} and unlock {next_t[1]}% extra off automatically at checkout"
+                )
+            elif tiers:
+                next_tier_msg = f"you already have the maximum {max_disc_all}% extra discount"
+            else:
+                next_tier_msg = "you already have our best available price"
 
-            # already_at_max_tier = we already reached the floor for this quantity
-            # Use floor_price (tier-based) not any saved floor from old state
-            already_at_max_tier = round(last_offer, 2) <= round(floor_price, 2)
-
-            if already_at_max_tier or last_offer <= floor_price:
-                # Explain tier limits and what quantity unlocks next tier
-                if quantity < 5:
-                    next_tier_msg = "buying 5+ units unlocks a 5% extra discount"
-                elif quantity < 10:
-                    next_tier_msg = "buying 10+ units unlocks a 10% extra discount"
-                elif quantity < 15:
-                    next_tier_msg = f"buying 15+ units unlocks a 15% extra discount"
-                else:
-                    next_tier_msg = "you already have our maximum quantity discount"
-
+            if already_at_floor or last_offer <= floor_price:
                 try:
                     resp = _client.chat.completions.create(
                         model       = AZURE_OPENAI_DEPLOYMENT,
@@ -983,23 +1073,23 @@ async def handle_negotiation(
                         messages    = [
                             {"role": "system", "content": (
                                 f"You are a friendly sales assistant for {biz_name}.\n"
-                                f"Customer has {quantity} units and already has the best "
-                                f"price of Rs.{last_offer:,.0f}/unit ({tier_pct}% extra off).\n"
-                                f"This is the maximum discount for {quantity} units.\n"
+                                f"Customer has {quantity} units (order value Rs.{order_value:,.0f}).\n"
+                                f"They already have the best price of Rs.{last_offer:,.0f}/unit "
+                                f"({cur_disc}% extra off based on their order value).\n"
+                                f"This is the maximum discount available.\n"
                                 f"Tip for more discount: {next_tier_msg}.\n"
-                                "Politely explain this and mention how they can get more.\n"
+                                "Politely explain this is our best price and mention the upsell tip.\n"
                                 f"Address as {sender}. Max 3 lines. Use *bold* for prices."
                             )},
-                            {"role": "user", "content": "Explain the tier limit."},
+                            {"role": "user", "content": "Explain the discount limit."},
                         ],
                     )
                     reply = resp.choices[0].message.content.strip()
                 except Exception:
-                    tip = next_tier_msg.capitalize()
                     reply = (
                         f"{sender}, *Rs.{last_offer:,.0f}/unit* is the best price "
-                        f"for {quantity} units ({tier_pct}% extra off). "
-                        f"Tip: {tip}! "
+                        f"for your current order of Rs.{order_value:,.0f}. "
+                        f"Tip: {next_tier_msg.capitalize()}! "
                         f"Would you like to proceed at this price?"
                     )
 
@@ -1123,14 +1213,14 @@ async def handle_negotiation(
                 "quantity":     quantity,
             }
 
-    # ── Step 5: First time — present tier offer ───────────────────────────────
-    offer  = calculate_offer(price_num, quantity)
+    # ── Step 5: First time — present value-based offer ───────────────────────
+    offer  = calculate_offer(price_num, quantity, tiers)
     rounds += 1
 
     if not offer["has_discount"]:
         reply = await _reply_no_discount(
             sender, product_name, price_num, regular_price,
-            graphrag_discount_pct, quantity, biz_name
+            graphrag_discount_pct, quantity, biz_name, tiers
         )
         return {
             "reply":        reply,
