@@ -489,7 +489,21 @@ async def process_message(data: dict):
                     if prompt:
                         reply = f"{reply}\n\n{prompt}"
         elif result.intent == "HUMAN_ESCALATION":
-            reply = await handle_escalation(incoming)
+            # ── Negotiation override ───────────────────────────────────────
+            # When an active negotiation is in progress, messages like
+            # "can i get for 3500?" get classified as HUMAN_ESCALATION
+            # (classifier sees price complaint) instead of negotiation.
+            # This skips call_graphrag_api entirely — the negotiation handler
+            # never runs — and the customer gets "team will contact you"
+            # instead of a proper counter-offer.
+            # Fix: if active neg_state exists, redirect to call_graphrag_api
+            # where _try_resolve_product_followup will handle it correctly.
+            _esc_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+            if _esc_neg_state and _esc_neg_state.get("product_name"):
+                print(f"[ESCALATION] Active negotiation detected — redirecting to negotiation handler")
+                reply = await call_graphrag_api(incoming, session_history)
+            else:
+                reply = await handle_escalation(incoming)
         elif result.intent == "GREETING":
             reply = await handle_greeting(incoming)
         else:
