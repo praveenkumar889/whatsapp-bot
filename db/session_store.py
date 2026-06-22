@@ -198,9 +198,8 @@ async def update_reply(
     try:
         update_data = {"reply_text": reply_text, "replied_at": replied_at}
         if graphrag_response is not None:
-            # Store raw GraphRAG response for analysis/debugging
-            # Truncate to 10000 chars to stay within DB limits
-            update_data["graphrag_response"] = str(graphrag_response)[:10000]
+            # Store complete GraphRAG response — DB column is TEXT (unlimited)
+            update_data["graphrag_response"] = str(graphrag_response)
         _get_client().table("messages") \
             .update(update_data) \
             .eq("message_id", message_id) \
@@ -943,3 +942,6 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
     except Exception as e:
         print(f"[DB] get_last_discussed_product failed: {e}")
         return None
+
+
+        #
