@@ -916,9 +916,9 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "either by naming them OR by asking a general selection/recommendation question like "
                     "'which is better', 'which is cheaper', 'which is best for limited budget', "
                     "'which should I choose', 'which one is more durable', 'what is the difference', "
-                    "'which one would you recommend' — any question that implies choosing between the "
-                    "products currently shown, even without naming them explicitly. "
-                    "If only 1 product is shown, set false.)\n"
+                    "'which one would you recommend', 'which is better for low budget' — any question "
+                    "that implies choosing between the products currently shown, even without naming "
+                    "them explicitly. If only 1 product is shown, set false.)\n"
                     "- asks_for_image: boolean (true if user asks to see/get/share a picture, image, photo, visual, "
                     "installation guide, installation steps, installation link, or asks 'where is the link', "
                     "'send me the link/guide', 'can you share it', or any request implying they want the actual "
@@ -1321,9 +1321,65 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     if name_lower in pname or pname in name_lower:
                         compared.append(p)
                         break
+
+        # ── Pronoun resolution ("compare THIS with Yash") ─────────────────
+        # When customer says "compare this/it with X", the parser extracts
+        # only explicit names (e.g. "Yash") — it cannot resolve "this" because
+        # it doesn't know which product is currently in context. Without this,
+        # "this" is dropped, compared = [Yash only], and the bot ends up
+        # comparing Sandy (list item #1) + Yash instead of Riya + Yash.
+        # Fix: if the message refers to the current product via a pronoun AND
+        # only one explicit product was found, inject the last-discussed product.
+        _has_pronoun = False
+        if len(compared) <= 1:
+            try:
+                pronoun_resp = _ai_client.chat.completions.create(
+                    model       = AZURE_OPENAI_DEPLOYMENT,
+                    max_tokens  = 5,
+                    temperature = 0,
+                    messages    = [
+                        {"role": "system", "content": (
+                            "Does this message contain a pronoun or vague reference "
+                            "(like 'this', 'it', 'the current one', 'this product', 'the above') "
+                            "that refers to a product already being discussed, rather than naming "
+                            "the product explicitly?\n"
+                            "Reply ONLY 'YES' or 'NO'."
+                        )},
+                        {"role": "user", "content": incoming.text},
+                    ],
+                )
+                _has_pronoun = "YES" in pronoun_resp.choices[0].message.content.strip().upper()
+            except Exception:
+                _has_pronoun = False
+
+        if _has_pronoun and len(compared) <= 1:
+            try:
+                from db.session_store import get_last_discussed_product
+                _last = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+                if _last:
+                    _last_lower = _last.lower().strip()
+                    _last_p = None
+                    for p in selection:
+                        pname = (p.get("product_name") or p.get("name") or "").lower()
+                        if _last_lower[:10] in pname or pname[:10] in _last_lower:
+                            _last_p = p
+                            break
+                    if _last_p is None:
+                        _last_p = {"product_name": _last, "name": _last}
+                    already_in = any(
+                        (_last_lower[:10] in (p.get("product_name") or p.get("name") or "").lower())
+                        for p in compared
+                    )
+                    if not already_in:
+                        compared.insert(0, _last_p)
+                        print(f"[FOLLOW-UP] Pronoun 'this' resolved to last-discussed: '{_last}'")
+            except Exception as e:
+                print(f"[FOLLOW-UP] Pronoun resolution failed (non-critical): {e}")
+
         if not compared:
             compared = selection
-        print(f"[FOLLOW-UP] Comparison mode (by name): {[c.get('product_name') or c.get('name') for c in compared]}")
+        print(f"[FOLLOW-UP] Comparison mode: {[c.get('product_name') or c.get('name') for c in compared]}")
+
 
         # If user explicitly asked for images, send them
         if asks_for_image:
