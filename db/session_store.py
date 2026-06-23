@@ -681,9 +681,9 @@ async def save_graphrag_product_selection(
                 "rating":                     p.get("rating", 0),
                 "review_count":               p.get("review_count", 0),
                 "feature_descriptions":       p.get("feature_descriptions", ""),
-                # global_offers — store-wide value-based discount tiers.
-                # Used by the negotiator to offer REAL discounts based on
-                # order value instead of hardcoded quantity tiers.
+                # global_offers — store-wide value-based discount tiers used by
+                # the negotiator to offer REAL discounts instead of hardcoded ones.
+                # e.g. "Extra 2% OFF | Rs 2500 ... Extra 5% OFF | Rs 7500 ..."
                 "global_offers":              p.get("global_offers", ""),
                 "warranty":                   p.get("warranty", ""),
                 "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
@@ -949,3 +949,84 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
 
 
         #
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TENANT OFFERS TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+# Stores global_offers text and parsed tiers per tenant.
+# global_offers is identical for every product from the same store —
+# storing it once per tenant avoids redundant data in product cache.
+#
+# SQL to create the table (run once in Supabase SQL Editor):
+#   CREATE TABLE IF NOT EXISTS tenant_offers (
+#       id          BIGSERIAL PRIMARY KEY,
+#       tenant_id   TEXT NOT NULL UNIQUE,
+#       offers_text TEXT NOT NULL,
+#       tiers_json  TEXT,
+#       updated_at  TIMESTAMPTZ DEFAULT NOW()
+#   );
+#   CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_offers_tenant
+#   ON tenant_offers(tenant_id);
+
+
+async def save_tenant_offers(
+    tenant_id:   str,
+    offers_text: str,
+    tiers_json:  str = None,
+) -> bool:
+    """
+    Upserts the global_offers text (and optionally pre-parsed tiers JSON)
+    for a tenant into the tenant_offers table.
+
+    Called whenever GraphRAG returns products — extracts global_offers from
+    the first product (they're all the same for the same store) and persists
+    it so the negotiator can always find real discount tiers.
+
+    Args:
+        tenant_id:   Business isolation key (e.g. "inventaa")
+        offers_text: Raw global_offers string from GraphRAG
+        tiers_json:  Optional pre-parsed tiers as JSON string
+                     e.g. "[[2500, 2], [7500, 5], [14500, 8]]"
+
+    Returns True on success, False on failure.
+    """
+    if not offers_text or not offers_text.strip():
+        return False
+    try:
+        row = {
+            "tenant_id":   tenant_id,
+            "offers_text": offers_text.strip(),
+            "tiers_json":  tiers_json,
+            "updated_at":  datetime.now(timezone.utc).isoformat(),
+        }
+        # Upsert — update if already exists, insert if not
+        _get_client().table("tenant_offers") \
+            .upsert(row, on_conflict="tenant_id") \
+            .execute()
+        print(f"[DB] tenant_offers saved for {tenant_id}")
+        return True
+    except Exception as e:
+        print(f"[DB] save_tenant_offers failed: {e}")
+        return False
+
+
+async def get_tenant_offers(tenant_id: str) -> Optional[dict]:
+    """
+    Fetches the stored global_offers for a tenant.
+
+    Returns:
+        dict with keys "offers_text" and "tiers_json" if found
+        None if not stored yet
+    """
+    try:
+        result = _get_client().table("tenant_offers") \
+            .select("offers_text, tiers_json") \
+            .eq("tenant_id", tenant_id) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        print(f"[DB] get_tenant_offers failed: {e}")
+        return None

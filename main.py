@@ -71,6 +71,8 @@ from db.session_store import (
     save_negotiation_state,
     get_negotiation_state,
     clear_negotiation_state,
+    save_tenant_offers,
+    get_tenant_offers,
 )
 from db.processing_lock import acquire_lock, release_lock, cleanup_stale_locks
 
@@ -315,6 +317,14 @@ async def process_message(data: dict):
                 _ng_disc_pct  = int(_pre_neg_state.get("graphrag_discount_pct") or 0)
                 if _ng_product and _ng_price_num > 0:
                     _resumed = {**_pre_neg_state, "awaiting_invoice_confirmation": False}
+                    # Resolve global_offers from state → tenant_offers table
+                    _ng_go = _pre_neg_state.get("global_offers")
+                    if not _ng_go:
+                        try:
+                            _ng_to = await get_tenant_offers(incoming.tenant_id)
+                            _ng_go = _ng_to.get("offers_text") if _ng_to else None
+                        except Exception:
+                            _ng_go = None
                     _ng_result = await handle_negotiation(
                         incoming              = incoming,
                         product_name          = _ng_product,
@@ -323,6 +333,7 @@ async def process_message(data: dict):
                         graphrag_discount_pct = _ng_disc_pct,
                         session_history       = session_history,
                         negotiation_state     = _resumed,
+                        global_offers         = _ng_go,
                     )
                     await save_negotiation_state(
                         incoming.tenant_id, incoming.session_id, _ng_result["state"]
@@ -477,7 +488,13 @@ async def process_message(data: dict):
                     reply = await call_graphrag_api(incoming, session_history)
         elif result.intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or result.confidence_score < 0.50:
             if result.confidence_score < 0.50:
-                reply = await handle_unknown(incoming)
+                # Low confidence → check for active negotiation before giving up
+                _unk_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+                if _unk_neg_state and _unk_neg_state.get("product_name"):
+                    print(f"[UNKNOWN] Active negotiation — redirecting to negotiation handler")
+                    reply = await call_graphrag_api(incoming, session_history)
+                else:
+                    reply = await handle_unknown(incoming)
             else:
                 reply = await call_graphrag_api(incoming, session_history)
                 # Auto-generate invoice in background after product selection / ordering actions
@@ -498,7 +515,13 @@ async def process_message(data: dict):
         elif result.intent == "GREETING":
             reply = await handle_greeting(incoming)
         else:
-            reply = await handle_unknown(incoming)
+            # Final fallback — check negotiation one more time
+            _fb_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+            if _fb_neg_state and _fb_neg_state.get("product_name"):
+                print(f"[FALLBACK] Active negotiation — redirecting to negotiation handler")
+                reply = await call_graphrag_api(incoming, session_history)
+            else:
+                reply = await handle_unknown(incoming)
 
         # ── Step 9: Send reply + store in DB ──────────────────────────────
         # POST to Meta Graph API. Split messages >3800 chars (GraphRAG can
@@ -622,6 +645,23 @@ async def _send_structured_product_list(incoming, products: list) -> str:
         print(f"[GRAPHRAG] Product selection saved to workflow_sessions")
     except Exception as e:
         print(f"[GRAPHRAG] Selection save failed (non-critical): {e}")
+
+    # ── Save global_offers to tenant_offers table ─────────────────────────────
+    # global_offers is identical for all products from the same store.
+    # Storing it once per tenant means the negotiator can always find real
+    # discount tiers even if the product cache entry is stale or missing.
+    try:
+        _go = next(
+            (p.get("global_offers") for p in products if p.get("global_offers")),
+            None
+        )
+        if _go:
+            await save_tenant_offers(
+                tenant_id   = incoming.tenant_id,
+                offers_text = _go,
+            )
+    except Exception as e:
+        print(f"[GRAPHRAG] tenant_offers save failed (non-critical): {e}")
 
     MAX_IMAGE_PRODUCTS = 3
     for i, p in enumerate(products, 1):
@@ -1048,14 +1088,12 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
                     "a follow-up question or selecting a specific item from the list shown above).\n"
-                    "- is_offer_inquiry: boolean (true if the user is asking about available offers, discounts, schemes, "
-                    "deals, or store policies — e.g. 'is there any offer?', 'any discount available?', 'what are the offers?', "
-                    "'do you have any scheme?', 'any deal on this?', 'what discounts do you give?', 'tell me about the offers', "
-                    "'any offers?', 'any special offer?'. "
-                    "Set true whenever the customer wants to SEE or KNOW the list of available offers — "
-                    "regardless of whether they are currently in a negotiation or not. "
-                    "Set false ONLY if they are counter-offering a specific price (e.g. 'can I get for Rs.3500', 'give me 10% off') "
-                    "— those are price negotiations, not offer inquiries.)\n\n"
+                    "- is_offer_inquiry: boolean (true if the user is asking to SEE the list of available offers, "
+                    "discounts, schemes, or store policies — e.g. 'is there any offer?', 'any discount?', "
+                    "'what are the offers?', 'any deal?', 'any scheme?', 'what discounts do you give?'. "
+                    "Set true even when in an active negotiation — customer wants to see the offer tiers. "
+                    "Set false ONLY for direct price counter-offers like 'can I get for Rs.2000', "
+                    "'give me 10% off', 'Can we go with 2000 each' — those are negotiations.)\n\n"
                     "CRITICAL: If the assistant's last message asked 'How many units...' or 'how many' and the user replies with a number, "
                     "that number is ALWAYS the quantity.\n"
                     "CRITICAL: A bare number on its own (e.g. customer just types '12') is ALWAYS a quantity, NEVER a product selection. "
@@ -1390,6 +1428,19 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         "awaiting_quantity": False,
                     }
 
+                    # Resolve global_offers: cached product → tenant_offers table → None
+                    # Priority: (1) fresh product cache, (2) tenant_offers table (persisted),
+                    # (3) negotiation state (from previous turn), (4) None (no tiers)
+                    _go_raw = cached.get("global_offers") if cached else None
+                    if not _go_raw:
+                        _go_raw = (current_state or {}).get("global_offers")
+                    if not _go_raw:
+                        try:
+                            _to = await get_tenant_offers(incoming.tenant_id)
+                            _go_raw = _to.get("offers_text") if _to else None
+                        except Exception:
+                            _go_raw = None
+
                     result = await handle_negotiation(
                         incoming               = incoming,
                         product_name           = product_name,
@@ -1398,6 +1449,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         graphrag_discount_pct  = discount_pct,
                         session_history        = session_history,
                         negotiation_state      = current_state,
+                        global_offers          = _go_raw,
                     )
 
                     await save_negotiation_state(
@@ -1546,11 +1598,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     matched_product = None
 
     # ── Case 0: Offer inquiry ─────────────────────────────────────────────────
-    # Customer asked "Any offers?", "Is there any discount?", "What deals?", etc.
-    # Fetch global_offers from the most recently shown product's cache and display
-    # it formatted — never hardcoded. Content comes entirely from GraphRAG data.
+    # Customer asked "Any offers?", "Any discount?", "What are the schemes?", etc.
+    # Show the real store offers from global_offers — never hardcoded.
+    # Sources in priority order: (1) product cache, (2) tenant_offers table
     if is_offer_inquiry:
         _offers_text = None
+        # Try product cache first
         for p in selection[:5]:
             pname = p.get("product_name") or p.get("name")
             if pname:
@@ -1559,6 +1612,14 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 if _go and str(_go).strip():
                     _offers_text = str(_go).strip()
                     break
+        # Fallback to dedicated tenant_offers table
+        if not _offers_text:
+            try:
+                _to = await get_tenant_offers(incoming.tenant_id)
+                if _to:
+                    _offers_text = _to.get("offers_text")
+            except Exception as _te:
+                print(f"[OFFER INQUIRY] tenant_offers fallback failed: {_te}")
 
         if _offers_text:
             try:
@@ -1569,13 +1630,13 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     messages    = [
                         {"role": "system", "content": (
                             f"You are a helpful sales assistant for {incoming.biz_name}.\n"
-                            f"The customer {incoming.sender_name} is asking about available offers.\n"
+                            f"The customer {incoming.sender_name} wants to see the current offers.\n"
                             "Format the store offers below as a clean WhatsApp message.\n"
                             "RULES:\n"
-                            "- Show each offer as a bullet point\n"
+                            "- Show each offer as a bullet point with an emoji\n"
                             "- Use *bold* for discount % and order value thresholds\n"
-                            "- Keep it concise and easy to read on mobile\n"
-                            "- Do NOT add, change, or invent any offer not present in the data\n"
+                            "- Keep it easy to read on mobile — one line per offer\n"
+                            "- Do NOT add, change, or invent anything not in the data below\n"
                             "- End with: 'Would you like to place an order to take advantage of these offers?'\n\n"
                             f"STORE OFFERS DATA:\n{_offers_text}"
                         )},
@@ -1584,7 +1645,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
                 return _offer_resp.choices[0].message.content.strip()
             except Exception as _oe:
-                print(f"[FOLLOW-UP] Offer inquiry LLM failed: {_oe}")
+                print(f"[OFFER INQUIRY] LLM format failed: {_oe}")
                 return (
                     f"Here are the current offers from {incoming.biz_name}, "
                     f"{incoming.sender_name}! 🎉\n\n"
@@ -1592,8 +1653,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
         else:
             return (
-                f"I don't have specific offer details right now, {incoming.sender_name}. "
-                f"Browse our products and I can check the best available price for you!"
+                f"I'll check the latest offers for you, {incoming.sender_name}! "
+                f"Browse our products and I can confirm the best available price."
             )
 
     # ── Case 1: Comparison OR recommendation ───────────────────────────────
