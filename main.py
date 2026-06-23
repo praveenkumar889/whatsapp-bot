@@ -1298,54 +1298,26 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
     # ── Negotiation check ────────────────────────────────────────────────────
+    # If customer asks for discount OR has active negotiation state, handle it.
+    # Runs BEFORE standard follow-up parsing.
+    # New-search guard: if customer asks for a new product category, clear
+    # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
-    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
-    # Run this FIRST, before the general parser and before is_negotiation_request.
-    # Reason: "any offers?" / "any offers for Olivia Stem?" → is_negotiation_request
-    # returns True (sees "offers" as discount request) and overrides the bypass.
-    # A focused YES/NO check here catches offer inquiries reliably and prevents
-    # them from ever reaching the negotiation path.
-    _is_offer_inq = False
-    try:
-        _oiq_resp = _ai_client.chat.completions.create(
-            model       = AZURE_OPENAI_DEPLOYMENT,
-            max_tokens  = 5,
-            temperature = 0,
-            messages    = [
-                {"role": "system", "content": (
-                    "Does this message ask to SEE the list of available store offers, "
-                    "discounts, or schemes?\n"
-                    "YES: 'any offers?', 'any offers for this?', 'any offers for Olivia Stem?', "
-                    "'is there any offer?', 'any discount?', 'what are the offers?', "
-                    "'any deals?', 'any scheme?', 'is there a discount on this product?'\n"
-                    "NO: 'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
-                    "'can we go with 2000 each', 'I want 5 units', 'is this waterproof?'\n"
-                    "Rule: messages with 'offer'/'discount'/'scheme'/'deal' = YES. "
-                    "Messages with a specific Rs. amount as counter = NO.\n"
-                    "Reply ONLY 'YES' or 'NO'."
-                )},
-                {"role": "user", "content": incoming.text},
-            ],
-        )
-        if "YES" in _oiq_resp.choices[0].message.content.strip().upper():
-            _is_offer_inq = True
-            print(f"[OFFER INQUIRY] Pre-check: YES for '{incoming.text}'")
-    except Exception as _oiq_e:
-        print(f"[OFFER INQUIRY] Pre-check failed: {_oiq_e}")
-
     # ── Always parse the follow-up BEFORE the negotiation check ─────────────
+    # Previously quick_parsed was only computed when neg_state was active.
+    # Bug: "suggest me one with low budget" → is_negotiation_request saw "budget"
+    # → entered negotiation path → asked "how many units of Romy?"
+    # Fix: always parse first. If is_comparison is True (recommendation/comparison
+    # intent), skip negotiation entirely so the comparison handler runs instead.
     _t_parse_early = time.monotonic()
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
     print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
 
-    # Merge offer inquiry from both pre-check and parser
-    _is_offer_inq = _is_offer_inq or quick_parsed.get("is_offer_inquiry", False)
-
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
             or quick_parsed.get("is_recommendation", False)
-            or _is_offer_inq):
+            or quick_parsed.get("is_offer_inquiry", False)):
         print(f"[FOLLOW-UP] is_comparison/recommendation/offer_inquiry — bypassing negotiation")
         neg_state = None
     elif neg_state:
@@ -1390,8 +1362,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     neg_state = None
 
     _t_neg_check_start = time.monotonic()
-    # Skip negotiation check entirely if offer inquiry was detected
-    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, session_history)
+    _is_neg_req = await is_negotiation_request(incoming.text, session_history)
     print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
@@ -1599,8 +1570,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
-    # Merge: pre-check (most reliable) OR parser result
-    is_offer_inquiry  = _is_offer_inq or parsed.get("is_offer_inquiry", False)
+    is_offer_inquiry  = parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
@@ -2109,6 +2079,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "name":                       cached_product.get("product_name"),
         "sku":                        cached_product.get("sku"),
         "price":                      f"Rs.{float(cached_product.get('list_price') or 0):,.0f}",
+        "list_price":                 float(cached_product.get("list_price") or 0),
+        "discount_pct":               cached_product.get("discount_pct", 0),
         "list_price_num":             float(cached_product.get("list_price") or 0),
         "regular_price":              f"Rs.{float(cached_product.get('regular_price') or 0):,.0f}",
         "discount":                   f"{cached_product.get('discount_pct', 0)}% off",
@@ -2121,6 +2093,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "warranty":                   cached_product.get("warranty", ""),
         "replacement_exchange_policy": cached_product.get("replacement_exchange_policy", ""),
         "installation_url":           cached_product.get("installation_url", ""),
+        "global_offers":              cached_product.get("global_offers", ""),
         "delivery_policy":            [
             pol.get("content", "") for pol in cached_product.get("policies", [])
         ],
@@ -2143,6 +2116,40 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     if parsed_qty is not None:
         product_context["parsed_order_quantity"] = parsed_qty
         product_context["parsed_order_unit"] = parsed_unit
+
+        # ── Auto-apply global offer tier ─────────────────────────────────────
+        # Check if this order value qualifies for any global offer tier.
+        # If yes, inject the discounted price into product_context so the LLM
+        # shows the correct final price automatically — no negotiation needed.
+        try:
+            from ai.negotiator import parse_global_offer_tiers as _pt, get_applicable_tier as _gat, get_next_tier as _gnt
+            _price = float(product_context.get("list_price") or 0)
+            _go    = product_context.get("global_offers") or ""
+            if not _go:
+                _to = await get_tenant_offers(incoming.tenant_id)
+                _go = _to.get("offers_text", "") if _to else ""
+            if _price > 0 and _go:
+                _tiers      = _pt(_go)
+                _order_val  = _price * int(parsed_qty)
+                _, _disc    = _gat(_order_val, _tiers)
+                _next_t     = _gnt(_order_val, _tiers)
+                if _disc > 0:
+                    _disc_price = round(_price * (1 - _disc / 100), 2)
+                    _disc_total = round(_disc_price * int(parsed_qty), 2)
+                    product_context["auto_offer_applied"] = True
+                    product_context["auto_offer_disc_pct"] = _disc
+                    product_context["auto_offer_unit_price"] = _disc_price
+                    product_context["auto_offer_total"] = _disc_total
+                    product_context["order_value_before_offer"] = _order_val
+                    if _next_t:
+                        _units_to_next = max(1, int((_next_t[0] - _order_val) / _price) + 1)
+                        product_context["auto_offer_upsell"] = (
+                            f"Order {_units_to_next} more unit(s) to reach "
+                            f"Rs.{_next_t[0]:,} and unlock {_next_t[1]}% off!"
+                        )
+                    print(f"[OFFER] Auto-applied {_disc}% tier to {product_name} x {parsed_qty}")
+        except Exception as _oe:
+            print(f"[OFFER] Auto-apply tier failed: {_oe}")
 
     recent_history = session_history[-6:] if session_history else []
 
@@ -2174,9 +2181,15 @@ INTENT A1 — ORDER WITH QUANTITY:
   Do NOT apply this intent if 'customer_just_selected_by_number' is true — see CRITICAL RULE above.
   → Generate a clear ORDER SUMMARY:
      • Product: [name]
-     • Quantity: [parsed_order_quantity or what customer said]
-     • Unit Price: [from product data]
-     • Total: [quantity × unit price]
+     • Quantity: [parsed_order_quantity]
+     • Regular price: [list_price]/unit (already [discount_pct]% off original)
+     IF 'auto_offer_applied' is true in PRODUCT DATA:
+       • Extra [auto_offer_disc_pct]% OFF applied (store offer): [auto_offer_unit_price]/unit
+       • Total: [auto_offer_total] 🎉
+       • Mention: "This is the best automatic store discount for your order value."
+       IF 'auto_offer_upsell' is present: mention it naturally once.
+     ELSE (no tier discount):
+       • Total: [quantity × list_price]
   → End with: "Please confirm and we'll process your order! 🎉"
   → NEVER ask "how many" again.
 
@@ -2743,9 +2756,3 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Opt
     except Exception as e:
         print(f"[WHATSAPP] Image send error: {e}")
         return None
-
-
-
-
-
-        #
