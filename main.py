@@ -450,7 +450,8 @@ async def process_message(data: dict):
                                 print(f"[INVOICE] Negotiated order created: {new_order.get('order_id')}")
                         except Exception as e:
                             print(f"[INVOICE] Negotiated order creation failed: {e}")
-                        reply = await handle_invoice_request(incoming)
+                            new_order = None
+                        reply = await handle_invoice_request(incoming, negotiated_order=new_order)
                     else:
                         # First time — show order summary, set flag, wait for confirmation
                         updated_state = {**neg_state_check, "awaiting_invoice_confirmation": True}
@@ -1402,15 +1403,37 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 regular_price  = float(cached.get("regular_price") or price_num)
                 discount_pct   = int(cached.get("discount_pct") or 0)
 
+                # ── Use auto-applied offer price as negotiation baseline ────────
+                # If the customer already received a global offer discount (e.g. 2% off),
+                # the negotiation should START from that discounted price, not the
+                # original list_price. The 5% floor is then on top of the offer price.
+                # e.g. list_price=Rs.1,113, auto-offer=2%→Rs.1,091, floor=5% off Rs.1,091
+                _saved_auto_price = (neg_state or {}).get("auto_offer_unit_price")
+                if _saved_auto_price and float(_saved_auto_price) < price_num:
+                    price_num = float(_saved_auto_price)
+                    print(f"[NEGOTIATOR] Using auto-offer price as baseline: Rs.{price_num:,.2f}")
+                else:
+                    # Check if the pending order context has an auto offer
+                    try:
+                        from db.session_store import get_pending_order as _gpo
+                        _pend = await _gpo(incoming.tenant_id, incoming.session_id)
+                        if _pend and _pend.get("auto_offer_unit_price"):
+                            _ap = float(_pend["auto_offer_unit_price"])
+                            if _ap < price_num:
+                                price_num = _ap
+                                print(f"[NEGOTIATOR] Auto-offer from pending order: Rs.{price_num:,.2f}")
+                    except Exception:
+                        pass
+
                 if price_num > 0:
                     current_state = neg_state or {
-                        "rounds":            0,
-                        "quantity":          None,
-                        "last_offer_price":  None,
-                        "floor_price":       None,
-                        "product_name":      product_name,
-                        "price_num":         price_num,
-                        "awaiting_quantity": False,
+                        "rounds":               0,
+                        "quantity":             None,
+                        "last_offer_price":     None,
+                        "floor_price":          None,
+                        "product_name":         product_name,
+                        "price_num":            price_num,
+                        "awaiting_quantity":    False,
                     }
 
                     result = await handle_negotiation(
@@ -2079,8 +2102,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "name":                       cached_product.get("product_name"),
         "sku":                        cached_product.get("sku"),
         "price":                      f"Rs.{float(cached_product.get('list_price') or 0):,.0f}",
-        "list_price":                 float(cached_product.get("list_price") or 0),
-        "discount_pct":               cached_product.get("discount_pct", 0),
         "list_price_num":             float(cached_product.get("list_price") or 0),
         "regular_price":              f"Rs.{float(cached_product.get('regular_price') or 0):,.0f}",
         "discount":                   f"{cached_product.get('discount_pct', 0)}% off",
@@ -2093,7 +2114,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "warranty":                   cached_product.get("warranty", ""),
         "replacement_exchange_policy": cached_product.get("replacement_exchange_policy", ""),
         "installation_url":           cached_product.get("installation_url", ""),
-        "global_offers":              cached_product.get("global_offers", ""),
         "delivery_policy":            [
             pol.get("content", "") for pol in cached_product.get("policies", [])
         ],
@@ -2116,40 +2136,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     if parsed_qty is not None:
         product_context["parsed_order_quantity"] = parsed_qty
         product_context["parsed_order_unit"] = parsed_unit
-
-        # ── Auto-apply global offer tier ─────────────────────────────────────
-        # Check if this order value qualifies for any global offer tier.
-        # If yes, inject the discounted price into product_context so the LLM
-        # shows the correct final price automatically — no negotiation needed.
-        try:
-            from ai.negotiator import parse_global_offer_tiers as _pt, get_applicable_tier as _gat, get_next_tier as _gnt
-            _price = float(product_context.get("list_price") or 0)
-            _go    = product_context.get("global_offers") or ""
-            if not _go:
-                _to = await get_tenant_offers(incoming.tenant_id)
-                _go = _to.get("offers_text", "") if _to else ""
-            if _price > 0 and _go:
-                _tiers      = _pt(_go)
-                _order_val  = _price * int(parsed_qty)
-                _, _disc    = _gat(_order_val, _tiers)
-                _next_t     = _gnt(_order_val, _tiers)
-                if _disc > 0:
-                    _disc_price = round(_price * (1 - _disc / 100), 2)
-                    _disc_total = round(_disc_price * int(parsed_qty), 2)
-                    product_context["auto_offer_applied"] = True
-                    product_context["auto_offer_disc_pct"] = _disc
-                    product_context["auto_offer_unit_price"] = _disc_price
-                    product_context["auto_offer_total"] = _disc_total
-                    product_context["order_value_before_offer"] = _order_val
-                    if _next_t:
-                        _units_to_next = max(1, int((_next_t[0] - _order_val) / _price) + 1)
-                        product_context["auto_offer_upsell"] = (
-                            f"Order {_units_to_next} more unit(s) to reach "
-                            f"Rs.{_next_t[0]:,} and unlock {_next_t[1]}% off!"
-                        )
-                    print(f"[OFFER] Auto-applied {_disc}% tier to {product_name} x {parsed_qty}")
-        except Exception as _oe:
-            print(f"[OFFER] Auto-apply tier failed: {_oe}")
 
     recent_history = session_history[-6:] if session_history else []
 
@@ -2181,15 +2167,9 @@ INTENT A1 — ORDER WITH QUANTITY:
   Do NOT apply this intent if 'customer_just_selected_by_number' is true — see CRITICAL RULE above.
   → Generate a clear ORDER SUMMARY:
      • Product: [name]
-     • Quantity: [parsed_order_quantity]
-     • Regular price: [list_price]/unit (already [discount_pct]% off original)
-     IF 'auto_offer_applied' is true in PRODUCT DATA:
-       • Extra [auto_offer_disc_pct]% OFF applied (store offer): [auto_offer_unit_price]/unit
-       • Total: [auto_offer_total] 🎉
-       • Mention: "This is the best automatic store discount for your order value."
-       IF 'auto_offer_upsell' is present: mention it naturally once.
-     ELSE (no tier discount):
-       • Total: [quantity × list_price]
+     • Quantity: [parsed_order_quantity or what customer said]
+     • Unit Price: [from product data]
+     • Total: [quantity × unit price]
   → End with: "Please confirm and we'll process your order! 🎉"
   → NEVER ask "how many" again.
 
@@ -2255,6 +2235,18 @@ PRODUCT DATA:
                     quantity_unit  = parsed_unit,
                 )
                 print(f"[ORDER] Saved pending order to DB: {product_name} x {parsed_qty}")
+                # Also save auto_offer_unit_price in negotiation state so subsequent
+                # negotiation uses the offer-applied price as baseline
+                if product_context.get("auto_offer_applied") and product_context.get("auto_offer_unit_price"):
+                    from db.session_store import save_negotiation_state as _sns
+                    await _sns(incoming.tenant_id, incoming.session_id, {
+                        "product_name":          product_name,
+                        "price_num":             product_context.get("list_price", 0),
+                        "auto_offer_unit_price": product_context["auto_offer_unit_price"],
+                        "quantity":              int(parsed_qty),
+                        "rounds":                0,
+                        "awaiting_quantity":     False,
+                    })
             except Exception as e:
                 print(f"[ORDER] Failed to save pending order: {e}")
 
@@ -2568,11 +2560,11 @@ async def _is_invoice_confirmation_request(incoming, session_history: list) -> b
         return False
 
 
-async def handle_invoice_request(incoming) -> str:
+async def handle_invoice_request(incoming, negotiated_order: dict = None) -> str:
     """
-    Handles request for invoice. Fetches the latest order from the database,
-    generates the tax invoice PDF, uploads it to Supabase Storage, and sends
-    the PDF URL to the customer.
+    Handles request for invoice. Uses negotiated_order if provided (avoids
+    re-fetching which could pick up a stale pending order instead of the
+    freshly-created negotiated order).
     """
     print(f"[INVOICE] Handling invoice request for session {incoming.session_id}")
     from db.session_store import (
@@ -2585,38 +2577,53 @@ async def handle_invoice_request(incoming) -> str:
     from db.product_store import create_order
     from utils.invoice import generate_and_upload_invoice
 
-    # Check if there is a pending order that needs to be committed upon user confirmation
-    try:
-        pending = await get_pending_order(incoming.tenant_id, incoming.session_id)
-        if pending:
-            print(f"[INVOICE] Committing pending order for session: {pending}")
-            product_name = pending["product_name"]
-            qty_val = pending["quantity_value"]
-            qty_unit = pending["quantity_unit"] or "units"
+    # If a negotiated order was already created upstream, use it directly.
+    # DO NOT commit any pending order on top of it — the pending order has the
+    # old quantity/price (before negotiation) and would overwrite the correct data.
+    if negotiated_order:
+        order = negotiated_order
+        print(f"[INVOICE] Using pre-created negotiated order: {order.get('order_id')}")
+        # Clean up stale pending order silently
+        try:
+            pending = await get_pending_order(incoming.tenant_id, incoming.session_id)
+            if pending:
+                await delete_pending_order(incoming.tenant_id, incoming.session_id)
+                print(f"[INVOICE] Deleted stale pending order (negotiated order takes precedence)")
+        except Exception:
+            pass
+    else:
+        # Check if there is a pending order that needs to be committed
+        try:
+            pending = await get_pending_order(incoming.tenant_id, incoming.session_id)
+            if pending:
+                print(f"[INVOICE] Committing pending order for session: {pending}")
+                product_name = pending["product_name"]
+                qty_val      = pending["quantity_value"]
+                qty_unit     = pending["quantity_unit"] or "units"
 
-            cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
-            if cached_product:
-                unit_price = float(cached_product.get("list_price") or 0)
-                items = [{
-                    "product_name":   product_name,
-                    "quantity_value": qty_val,
-                    "quantity_unit":  qty_unit,
-                    "unit_price":     unit_price,
-                    "total_price":    qty_val * unit_price,
-                }]
-                new_order = await create_order(
-                    tenant_id   = incoming.tenant_id,
-                    session_id  = incoming.session_id,
-                    sender_name = incoming.sender_name,
-                    items       = items,
-                )
-                if new_order:
-                    print(f"[INVOICE] Order committed successfully: {new_order.get('order_id')}")
-                    await delete_pending_order(incoming.tenant_id, incoming.session_id)
-    except Exception as commit_err:
-        print(f"[INVOICE] Error committing pending order: {commit_err}")
+                cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
+                if cached_product:
+                    unit_price = float(cached_product.get("list_price") or 0)
+                    items = [{
+                        "product_name":   product_name,
+                        "quantity_value": qty_val,
+                        "quantity_unit":  qty_unit,
+                        "unit_price":     unit_price,
+                        "total_price":    qty_val * unit_price,
+                    }]
+                    new_order = await create_order(
+                        tenant_id   = incoming.tenant_id,
+                        session_id  = incoming.session_id,
+                        sender_name = incoming.sender_name,
+                        items       = items,
+                    )
+                    if new_order:
+                        print(f"[INVOICE] Order committed successfully: {new_order.get('order_id')}")
+                        await delete_pending_order(incoming.tenant_id, incoming.session_id)
+        except Exception as commit_err:
+            print(f"[INVOICE] Error committing pending order: {commit_err}")
 
-    order = await get_last_order_from_orders(incoming.tenant_id, incoming.session_id)
+        order = await get_last_order_from_orders(incoming.tenant_id, incoming.session_id)
     if not order:
         return (
             f"I couldn't find any recent orders for you, {incoming.sender_name}. 🤔\n\n"
