@@ -602,7 +602,6 @@ async def _send_structured_product_list(incoming, products: list) -> str:
                 cached_item = [{
                     "product_name":               p.get("name"),
                     "list_price":                 float(p.get("price_num", 0)),
-                    "floor_price":                float(p.get("price_num", 0)) * 0.85,
                     "sku":                        sku,
                     "image_url":                  p.get("image_url"),
                     "installation_url":           p.get("installation_url"),
@@ -1409,7 +1408,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         "rounds":            0,
                         "quantity":          None,
                         "last_offer_price":  None,
-                        "floor_price":       round(price_num * 0.85, 2),
+                        "floor_price":       None,  # computed by handle_negotiation from real tiers
                         "product_name":      product_name,
                         "price_num":         price_num,
                         "awaiting_quantity": False,
