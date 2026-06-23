@@ -1305,20 +1305,46 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
+    # Runs BEFORE parse and is_negotiation_request.
+    # "Currently is there any offers?" → is_negotiation_request returns True
+    # (sees "offers" as discount). This focused check catches it first.
+    _is_offer_inq = False
+    try:
+        _oiq = _ai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
+            messages=[
+                {"role": "system", "content": (
+                    "Does this message ask to SEE available store offers, discounts or schemes?\n"
+                    "YES: 'any offers?', 'currently is there any offers?', 'any offers for this?', "
+                    "'any offers for Olivia Stem?', 'is there any offer?', 'any discount?', "
+                    "'what are the offers?', 'any deals?', 'any scheme?'\n"
+                    "NO: 'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
+                    "'can we go with 2000 each'\n"
+                    "Rule: 'offer'/'discount'/'scheme'/'deal' → YES. Specific Rs. as counter → NO.\n"
+                    "Reply ONLY 'YES' or 'NO'."
+                )},
+                {"role": "user", "content": incoming.text},
+            ],
+        )
+        if "YES" in _oiq.choices[0].message.content.strip().upper():
+            _is_offer_inq = True
+            print(f"[OFFER INQUIRY] Pre-check YES: '{incoming.text}'")
+    except Exception as _oiqe:
+        print(f"[OFFER INQUIRY] Pre-check failed: {_oiqe}")
+
     # ── Always parse the follow-up BEFORE the negotiation check ─────────────
-    # Previously quick_parsed was only computed when neg_state was active.
-    # Bug: "suggest me one with low budget" → is_negotiation_request saw "budget"
-    # → entered negotiation path → asked "how many units of Romy?"
-    # Fix: always parse first. If is_comparison is True (recommendation/comparison
-    # intent), skip negotiation entirely so the comparison handler runs instead.
     _t_parse_early = time.monotonic()
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
     print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
 
+    # Merge pre-check with parser result
+    _is_offer_inq = _is_offer_inq or quick_parsed.get("is_offer_inquiry", False)
+
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
             or quick_parsed.get("is_recommendation", False)
-            or quick_parsed.get("is_offer_inquiry", False)):
+            or _is_offer_inq):
         print(f"[FOLLOW-UP] is_comparison/recommendation/offer_inquiry — bypassing negotiation")
         neg_state = None
     elif neg_state:
@@ -1363,7 +1389,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     neg_state = None
 
     _t_neg_check_start = time.monotonic()
-    _is_neg_req = await is_negotiation_request(incoming.text, session_history)
+    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, session_history)
     print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
@@ -1403,37 +1429,22 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 regular_price  = float(cached.get("regular_price") or price_num)
                 discount_pct   = int(cached.get("discount_pct") or 0)
 
-                # ── Use auto-applied offer price as negotiation baseline ────────
-                # If the customer already received a global offer discount (e.g. 2% off),
-                # the negotiation should START from that discounted price, not the
-                # original list_price. The 5% floor is then on top of the offer price.
-                # e.g. list_price=Rs.1,113, auto-offer=2%→Rs.1,091, floor=5% off Rs.1,091
-                _saved_auto_price = (neg_state or {}).get("auto_offer_unit_price")
-                if _saved_auto_price and float(_saved_auto_price) < price_num:
-                    price_num = float(_saved_auto_price)
-                    print(f"[NEGOTIATOR] Using auto-offer price as baseline: Rs.{price_num:,.2f}")
-                else:
-                    # Check if the pending order context has an auto offer
-                    try:
-                        from db.session_store import get_pending_order as _gpo
-                        _pend = await _gpo(incoming.tenant_id, incoming.session_id)
-                        if _pend and _pend.get("auto_offer_unit_price"):
-                            _ap = float(_pend["auto_offer_unit_price"])
-                            if _ap < price_num:
-                                price_num = _ap
-                                print(f"[NEGOTIATOR] Auto-offer from pending order: Rs.{price_num:,.2f}")
-                    except Exception:
-                        pass
+                # Use auto-applied offer price as negotiation baseline if present
+                # (e.g. 2% auto-offer → Rs.1,091; negotiate 5% FROM that, not Rs.1,113)
+                _saved_auto = (neg_state or {}).get("auto_offer_unit_price")
+                if _saved_auto and float(_saved_auto) < price_num:
+                    price_num = float(_saved_auto)
+                    print(f"[NEGOTIATOR] Using auto-offer baseline: Rs.{price_num:,.2f}")
 
                 if price_num > 0:
                     current_state = neg_state or {
-                        "rounds":               0,
-                        "quantity":             None,
-                        "last_offer_price":     None,
-                        "floor_price":          None,
-                        "product_name":         product_name,
-                        "price_num":            price_num,
-                        "awaiting_quantity":    False,
+                        "rounds":            0,
+                        "quantity":          None,
+                        "last_offer_price":  None,
+                        "floor_price":       None,
+                        "product_name":      product_name,
+                        "price_num":         price_num,
+                        "awaiting_quantity": False,
                     }
 
                     result = await handle_negotiation(
@@ -1593,7 +1604,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
-    is_offer_inquiry  = parsed.get("is_offer_inquiry", False)
+    # Merge: dedicated pre-check (most reliable) OR parser result
+    is_offer_inquiry  = _is_offer_inq or parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
@@ -2235,18 +2247,6 @@ PRODUCT DATA:
                     quantity_unit  = parsed_unit,
                 )
                 print(f"[ORDER] Saved pending order to DB: {product_name} x {parsed_qty}")
-                # Also save auto_offer_unit_price in negotiation state so subsequent
-                # negotiation uses the offer-applied price as baseline
-                if product_context.get("auto_offer_applied") and product_context.get("auto_offer_unit_price"):
-                    from db.session_store import save_negotiation_state as _sns
-                    await _sns(incoming.tenant_id, incoming.session_id, {
-                        "product_name":          product_name,
-                        "price_num":             product_context.get("list_price", 0),
-                        "auto_offer_unit_price": product_context["auto_offer_unit_price"],
-                        "quantity":              int(parsed_qty),
-                        "rounds":                0,
-                        "awaiting_quantity":     False,
-                    })
             except Exception as e:
                 print(f"[ORDER] Failed to save pending order: {e}")
 
@@ -2562,9 +2562,8 @@ async def _is_invoice_confirmation_request(incoming, session_history: list) -> b
 
 async def handle_invoice_request(incoming, negotiated_order: dict = None) -> str:
     """
-    Handles request for invoice. Uses negotiated_order if provided (avoids
-    re-fetching which could pick up a stale pending order instead of the
-    freshly-created negotiated order).
+    Generates invoice. If negotiated_order is provided (from negotiation confirm
+    flow), uses it directly — skips pending order lookup which has old qty/price.
     """
     print(f"[INVOICE] Handling invoice request for session {incoming.session_id}")
     from db.session_store import (
@@ -2577,30 +2576,27 @@ async def handle_invoice_request(incoming, negotiated_order: dict = None) -> str
     from db.product_store import create_order
     from utils.invoice import generate_and_upload_invoice
 
-    # If a negotiated order was already created upstream, use it directly.
-    # DO NOT commit any pending order on top of it — the pending order has the
-    # old quantity/price (before negotiation) and would overwrite the correct data.
     if negotiated_order:
+        # Use the freshly-created negotiated order directly.
+        # DO NOT commit any pending order — it has old qty/price from before negotiation.
         order = negotiated_order
-        print(f"[INVOICE] Using pre-created negotiated order: {order.get('order_id')}")
-        # Clean up stale pending order silently
+        print(f"[INVOICE] Using negotiated order: {order.get('order_id')}")
         try:
             pending = await get_pending_order(incoming.tenant_id, incoming.session_id)
             if pending:
                 await delete_pending_order(incoming.tenant_id, incoming.session_id)
-                print(f"[INVOICE] Deleted stale pending order (negotiated order takes precedence)")
+                print(f"[INVOICE] Deleted stale pending order")
         except Exception:
             pass
     else:
-        # Check if there is a pending order that needs to be committed
+        # Commit pending order if exists (direct order without negotiation)
         try:
             pending = await get_pending_order(incoming.tenant_id, incoming.session_id)
             if pending:
-                print(f"[INVOICE] Committing pending order for session: {pending}")
+                print(f"[INVOICE] Committing pending order: {pending}")
                 product_name = pending["product_name"]
-                qty_val      = pending["quantity_value"]
-                qty_unit     = pending["quantity_unit"] or "units"
-
+                qty_val  = pending["quantity_value"]
+                qty_unit = pending["quantity_unit"] or "units"
                 cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
                 if cached_product:
                     unit_price = float(cached_product.get("list_price") or 0)
@@ -2618,7 +2614,7 @@ async def handle_invoice_request(incoming, negotiated_order: dict = None) -> str
                         items       = items,
                     )
                     if new_order:
-                        print(f"[INVOICE] Order committed successfully: {new_order.get('order_id')}")
+                        print(f"[INVOICE] Order committed: {new_order.get('order_id')}")
                         await delete_pending_order(incoming.tenant_id, incoming.session_id)
         except Exception as commit_err:
             print(f"[INVOICE] Error committing pending order: {commit_err}")
