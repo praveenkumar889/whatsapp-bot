@@ -1435,11 +1435,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 regular_price  = float(cached.get("regular_price") or price_num)
                 discount_pct   = int(cached.get("discount_pct") or 0)
 
-                # ── Use auto_offer_unit_price as negotiation baseline ─────────
-                # When a global offer tier was auto-applied (e.g. 8% for 6 units
-                # → Rs.2,293/unit), negotiation should start FROM that price,
-                # not the original list price. Otherwise the counter-offer calc
-                # uses the wrong baseline and produces wrong numbers.
+                # Use auto_offer_unit_price as negotiation baseline when present.
+                # When a tier was auto-applied (e.g. 8% → Rs.2,617), negotiation
+                # must start FROM that price, not the original list price.
                 _saved_auto = (neg_state or {}).get("auto_offer_unit_price")
                 if _saved_auto and float(_saved_auto) < price_num:
                     price_num = float(_saved_auto)
@@ -2352,11 +2350,9 @@ PRODUCT DATA:
                     quantity_unit  = parsed_unit,
                 )
                 print(f"[ORDER] Saved pending order to DB: {product_name} x {parsed_qty}")
-
-                # ── Always clear stale state + save fresh state ──────────────
-                # Prevents stale quantity (e.g. 4 from a previous session) from
-                # making "add 2 more units" calculate 4+2=6 instead of 2+2=4,
-                # or from using the wrong auto_offer_unit_price in negotiation.
+                # Always clear stale state then save fresh state with correct quantity.
+                # Prevents stale quantity (e.g. 5 from a previous session) from making
+                # "add 1 more unit" compute 5+1=6 instead of correct 4+1=5.
                 await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                 _fresh_neg = {
                     "product_name":      product_name,
@@ -2369,7 +2365,7 @@ PRODUCT DATA:
                     _fresh_neg["auto_offer_unit_price"] = product_context["auto_offer_unit_price"]
                     _fresh_neg["auto_offer_disc_pct"]   = product_context.get("auto_offer_disc_pct", 0)
                 await save_negotiation_state(incoming.tenant_id, incoming.session_id, _fresh_neg)
-                print(f"[OFFER] Saved fresh neg_state qty={parsed_qty} auto={_fresh_neg.get('auto_offer_unit_price')}")
+                print(f"[OFFER] Fresh neg_state qty={parsed_qty} auto={_fresh_neg.get('auto_offer_unit_price')}")
             except Exception as e:
                 print(f"[ORDER] Failed to save pending order: {e}")
 

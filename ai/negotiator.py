@@ -915,13 +915,13 @@ async def handle_negotiation(
             offer       = calculate_offer(price_num, quantity, tiers)
             rounds     += 1
 
-            # ── Is this ONLY a quantity change or also a discount request? ──
-            # NO session_history — history has upsell messages like "Order 2
-            # more to unlock 5%!" which confuse the LLM into seeing quantity
-            # changes as discount requests. Judge the message alone.
+            # ── Check if this is ONLY a quantity change (no discount request) ──
+            # Focused LLM call with NO session_history — history has upsell
+            # messages like "Order 1 more to unlock 8%!" which confuse the
+            # LLM into treating pure quantity changes as discount requests.
             _is_discount_req = True  # safe default
             try:
-                _disc_check = _client.chat.completions.create(
+                _dc = _client.chat.completions.create(
                     model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
                     messages=[
                         {"role": "system", "content": (
@@ -929,22 +929,20 @@ async def handle_negotiation(
                             "YES: 'give me a discount', 'can I get extra off', "
                             "'reduce the price', 'any additional discount'\n"
                             "NO: 'add 2 more units', 'ok then add 4 units', "
-                            "'make it 9 units', 'then add 1 more unit'\n"
+                            "'make it 9 units', 'then add 1 more unit', 'add one more'\n"
                             "Reply ONLY 'YES' or 'NO'."
                         )},
                         {"role": "user", "content": msg},
                     ],
                 )
-                _is_discount_req = "YES" in _disc_check.choices[0].message.content.strip().upper()
+                _is_discount_req = "YES" in _dc.choices[0].message.content.strip().upper()
             except Exception as _dce:
                 print(f"[NEGOTIATOR] discount-check failed: {_dce}")
-                _is_discount_req = False  # assume pure quantity change on failure
+                _is_discount_req = False
 
             if not _is_discount_req:
                 # Pure quantity change — auto-apply the applicable global offer tier
                 order_value   = price_num * quantity
-
-                # Fetch tiers from tenant_offers if not available in state
                 _active_tiers = tiers
                 if not _active_tiers:
                     try:
@@ -954,7 +952,6 @@ async def handle_negotiation(
                             _active_tiers = parse_global_offer_tiers(_to["offers_text"])
                     except Exception as _te:
                         print(f"[NEGOTIATOR] tenant_offers fetch failed: {_te}")
-
                 _, auto_disc = get_applicable_tier(order_value, _active_tiers) if _active_tiers else (0, 0)
 
                 if auto_disc > 0:
