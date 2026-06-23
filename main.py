@@ -322,8 +322,7 @@ async def process_message(data: dict):
                         try:
                             _ng_to = await get_tenant_offers(incoming.tenant_id)
                             _ng_go = _ng_to.get("offers_text") if _ng_to else None
-                        except Exception:
-                            _ng_go = None
+                        except Exception: _ng_go = None
                     _ng_result = await handle_negotiation(
                         incoming              = incoming,
                         product_name          = _ng_product,
@@ -637,7 +636,6 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     except Exception as e:
         print(f"[GRAPHRAG] Selection save failed (non-critical): {e}")
 
-    # Persist global_offers once per tenant
     try:
         _go = next((p.get("global_offers") for p in products if p.get("global_offers")), None)
         if _go:
@@ -1070,16 +1068,17 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
                     "- is_new_search: boolean (true if the user is requesting to browse or know details about a general category or product type "
                     "e.g., 'I want to know the details about garden lights', 'show me gate lights', 'solar lights', rather than asking "
                     "a follow-up question or selecting a specific item from the list shown above).\n"
-                    "- is_offer_inquiry: boolean — VERY IMPORTANT. Set true if the user asks to SEE the list of "
-                    "available store offers, discounts, or schemes. This includes ALL of these:\n"
-                    "  'any offers?', 'any offers for this?', 'any offers for this product?', "
-                    "'is there any offer?', 'any discount?', 'what are the offers?', 'any deal?', "
-                    "'any scheme?', 'tell me the offers', 'what discounts do you have?', "
-                    "'any special offer?', 'what offers are available?'\n"
-                    "Set is_offer_inquiry=true even when the customer is asking about offers FOR a specific product "
-                    "they are currently viewing — 'any offers for this product?' = is_offer_inquiry=TRUE.\n"
-                    "Set is_offer_inquiry=FALSE only for direct price counter-offers that name a specific amount: "
-                    "'can I get for Rs.2000', 'give me 10% off', 'can we go with 2000 each'.\n\n"
+                    "- is_offer_inquiry: boolean — Set TRUE when customer asks to SEE available offers or discounts. "
+                    "This includes asking about offers for a SPECIFIC product by name:\n"
+                    "  TRUE examples: 'any offers?', 'is there any offer?', 'any discount available?', "
+                    "'what are the offers?', 'any scheme?', 'any deals?', "
+                    "'is there any offers for Olivia Stem?', 'any offers for this product?', "
+                    "'any offers for Sandy?', 'is there a discount on Romy?', "
+                    "'what discount do I get?', 'any special offer for this?'\n"
+                    "  FALSE examples: 'can I get for Rs.2000', 'give me 10% off', "
+                    "'can we go with 2000 each', 'I want it for 1500', 'my budget is 3000'\n"
+                    "Key rule: if it has 'offer', 'discount', 'scheme', 'deal' → TRUE. "
+                    "If it has a specific Rs. amount as a counter-price → FALSE.\n\n"
                     "CRITICAL: If the assistant's last message asked 'How many units...' or 'how many' and the user replies with a number, "
                     "that number is ALWAYS the quantity.\n"
                     "CRITICAL: A bare number on its own (e.g. customer just types '12') is ALWAYS a quantity, NEVER a product selection. "
@@ -1299,26 +1298,54 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
     # ── Negotiation check ────────────────────────────────────────────────────
-    # If customer asks for discount OR has active negotiation state, handle it.
-    # Runs BEFORE standard follow-up parsing.
-    # New-search guard: if customer asks for a new product category, clear
-    # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
+    # Run this FIRST, before the general parser and before is_negotiation_request.
+    # Reason: "any offers?" / "any offers for Olivia Stem?" → is_negotiation_request
+    # returns True (sees "offers" as discount request) and overrides the bypass.
+    # A focused YES/NO check here catches offer inquiries reliably and prevents
+    # them from ever reaching the negotiation path.
+    _is_offer_inq = False
+    try:
+        _oiq_resp = _ai_client.chat.completions.create(
+            model       = AZURE_OPENAI_DEPLOYMENT,
+            max_tokens  = 5,
+            temperature = 0,
+            messages    = [
+                {"role": "system", "content": (
+                    "Does this message ask to SEE the list of available store offers, "
+                    "discounts, or schemes?\n"
+                    "YES: 'any offers?', 'any offers for this?', 'any offers for Olivia Stem?', "
+                    "'is there any offer?', 'any discount?', 'what are the offers?', "
+                    "'any deals?', 'any scheme?', 'is there a discount on this product?'\n"
+                    "NO: 'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
+                    "'can we go with 2000 each', 'I want 5 units', 'is this waterproof?'\n"
+                    "Rule: messages with 'offer'/'discount'/'scheme'/'deal' = YES. "
+                    "Messages with a specific Rs. amount as counter = NO.\n"
+                    "Reply ONLY 'YES' or 'NO'."
+                )},
+                {"role": "user", "content": incoming.text},
+            ],
+        )
+        if "YES" in _oiq_resp.choices[0].message.content.strip().upper():
+            _is_offer_inq = True
+            print(f"[OFFER INQUIRY] Pre-check: YES for '{incoming.text}'")
+    except Exception as _oiq_e:
+        print(f"[OFFER INQUIRY] Pre-check failed: {_oiq_e}")
+
     # ── Always parse the follow-up BEFORE the negotiation check ─────────────
-    # Previously quick_parsed was only computed when neg_state was active.
-    # Bug: "suggest me one with low budget" → is_negotiation_request saw "budget"
-    # → entered negotiation path → asked "how many units of Romy?"
-    # Fix: always parse first. If is_comparison is True (recommendation/comparison
-    # intent), skip negotiation entirely so the comparison handler runs instead.
     _t_parse_early = time.monotonic()
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
     print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
 
+    # Merge offer inquiry from both pre-check and parser
+    _is_offer_inq = _is_offer_inq or quick_parsed.get("is_offer_inquiry", False)
+
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
             or quick_parsed.get("is_recommendation", False)
-            or quick_parsed.get("is_offer_inquiry", False)):
+            or _is_offer_inq):
         print(f"[FOLLOW-UP] is_comparison/recommendation/offer_inquiry — bypassing negotiation")
         neg_state = None
     elif neg_state:
@@ -1363,7 +1390,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     neg_state = None
 
     _t_neg_check_start = time.monotonic()
-    _is_neg_req = await is_negotiation_request(incoming.text, session_history)
+    # Skip negotiation check entirely if offer inquiry was detected
+    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, session_history)
     print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
@@ -1408,7 +1436,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         "rounds":            0,
                         "quantity":          None,
                         "last_offer_price":  None,
-                        "floor_price":       None,  # computed by handle_negotiation from real tiers
+                        "floor_price":       None,
                         "product_name":      product_name,
                         "price_num":         price_num,
                         "awaiting_quantity": False,
@@ -1571,64 +1599,55 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
-    is_offer_inquiry  = parsed.get("is_offer_inquiry", False)
+    # Merge: pre-check (most reliable) OR parser result
+    is_offer_inquiry  = _is_offer_inq or parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
 
-    # ── Case 0: Offer inquiry — show global_offers with calculated prices ─────
-    # Triggered by: "any offers?", "any offers for this product?", "any discounts?",
-    # "what schemes do you have?", etc.
-    #
-    # Two-layer detection:
-    #   1. quick_parsed.is_offer_inquiry (from early parse above)
-    #   2. Dedicated focused LLM check as fallback (in case early parse missed it)
-    #      — runs BEFORE is_negotiation_request so it can never be overridden
-    #
-    # After showing offers: if customer asks for extra discount → they ask quantity
-    # → enters normal negotiation path (5% floor, 4 turns)
-
-    # Layer 2: dedicated check if early parse missed it
+    # ── Case 0: Offer inquiry ─────────────────────────────────────────────────
+    # Two-layer detection — layer 2 specifically handles "offers for [product name]"
+    # which layer 1 sometimes misses due to product context.
     if not is_offer_inquiry:
         try:
-            _oi_resp = _ai_client.chat.completions.create(
+            _oi = _ai_client.chat.completions.create(
                 model       = AZURE_OPENAI_DEPLOYMENT,
                 max_tokens  = 5,
                 temperature = 0,
                 messages    = [
                     {"role": "system", "content": (
-                        "Does this message ask to SEE the list of available store offers, "
-                        "discounts, or schemes? Examples that are YES: "
-                        "'any offers?', 'any offers for this?', 'any offers for this product?', "
-                        "'is there any offer?', 'any discount available?', 'what are the offers?', "
-                        "'any deals?', 'any scheme?', 'what discounts do you have?'. "
-                        "Examples that are NO: 'can I get for Rs.2000', 'give me 10% off', "
-                        "'I want 5 units', 'is this waterproof?'. "
+                        "Does this message ask to SEE available store offers, discounts or schemes?\n"
+                        "YES: 'any offers?', 'any offers for this?', 'any offers for Olivia Stem?', "
+                        "'is there any offers for Sandy?', 'any discount?', 'what are the offers?', "
+                        "'any deal?', 'any scheme?', 'is there a discount on this product?'\n"
+                        "NO: 'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
+                        "'my budget is 3000', 'can we go with 2000 each'\n"
+                        "Rule: messages with 'offer'/'discount'/'scheme'/'deal' → YES. "
+                        "Messages with a specific Rs. amount as counter → NO.\n"
                         "Reply ONLY 'YES' or 'NO'."
                     )},
                     {"role": "user", "content": incoming.text},
                 ],
             )
-            if "YES" in _oi_resp.choices[0].message.content.strip().upper():
+            if "YES" in _oi.choices[0].message.content.strip().upper():
                 is_offer_inquiry = True
-                print(f"[OFFER INQUIRY] Detected by dedicated check: '{incoming.text}'")
-        except Exception as _oie:
-            print(f"[OFFER INQUIRY] Dedicated check failed: {_oie}")
+                print(f"[OFFER INQUIRY] Detected via layer-2: '{incoming.text}'")
+        except Exception as _e:
+            print(f"[OFFER INQUIRY] Layer-2 check failed: {_e}")
 
     if is_offer_inquiry:
-        # Resolve global_offers from cache → tenant_offers table
-        _offers_text     = None
-        _price_for_tiers = None
-        _prod_name_tiers = None
+        _offers_text = None
+        _price_num   = None
+        _prod_name   = None
         for p in selection[:5]:
             pname = p.get("product_name") or p.get("name")
             if pname:
                 _cp = await get_cached_product_by_name(incoming.tenant_id, pname)
                 _go = (_cp or p).get("global_offers")
                 if _go and str(_go).strip():
-                    _offers_text     = str(_go).strip()
-                    _price_for_tiers = float((_cp or p).get("list_price") or p.get("price_num") or 0)
-                    _prod_name_tiers = pname
+                    _offers_text = str(_go).strip()
+                    _price_num   = float((_cp or p).get("list_price") or p.get("price_num") or 0)
+                    _prod_name   = pname
                     break
         if not _offers_text:
             try:
@@ -1639,21 +1658,23 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 pass
 
         if _offers_text:
-            # Calculate actual prices per tier
             _tier_ctx = ""
             try:
                 from ai.negotiator import parse_global_offer_tiers as _pt
                 _tiers = _pt(_offers_text)
-                if _tiers and _price_for_tiers and _price_for_tiers > 0:
+                if _tiers and _price_num and _price_num > 0:
                     _lines = []
                     for _mv, _dp in _tiers:
-                        _dp_price  = round(_price_for_tiers * (1 - _dp / 100), 2)
-                        _min_units = max(1, int(_mv / _price_for_tiers) + (1 if _mv % _price_for_tiers else 0))
+                        _dp_price  = round(_price_num * (1 - _dp / 100), 2)
+                        _min_units = max(1, int(_mv / _price_num) + (1 if _mv % _price_num else 0))
                         _lines.append(
-                            f"  Rs.{_mv:,}+ order → {_dp}% off → Rs.{_dp_price:,.0f}/unit "
-                            f"(≈{_min_units}+ units of {_prod_name_tiers})"
+                            f"  Rs.{_mv:,}+ order → {_dp}% off → "
+                            f"Rs.{_dp_price:,.0f}/unit (≈{_min_units}+ units)"
                         )
-                    _tier_ctx = "\n\nCalculated prices:\n" + "\n".join(_lines)
+                    _tier_ctx = (
+                        f"\n\nCalculated prices for {_prod_name} (Rs.{_price_num:,.0f}/unit):\n"
+                        + "\n".join(_lines)
+                    )
             except Exception:
                 pass
 
@@ -1666,15 +1687,14 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         {"role": "system", "content": (
                             f"You are a sales assistant for {incoming.biz_name}.\n"
                             f"Customer {incoming.sender_name} wants to see available offers.\n"
-                            "Format the store offers below as a clean WhatsApp message.\n"
-                            "RULES:\n"
-                            "- One bullet per offer with an emoji\n"
-                            "- Use *bold* for discount % and order thresholds\n"
-                            "- If calculated prices are provided, show them: "
-                            "e.g. '🟢 *5% OFF* on orders *Rs.7,500+* → *Rs.803/unit*'\n"
-                            "- Show free shipping and return policy too\n"
+                            "Show the offers as a clean WhatsApp message with calculated prices.\n"
+                            "FORMAT:\n"
+                            "- One bullet per tier with emoji\n"
+                            "- *bold* for % and thresholds\n"
+                            "- Show actual price per unit at each tier\n"
+                            "- Also mention free shipping and return policy\n"
                             "- Do NOT invent any numbers — use only what is provided\n"
-                            "- End with: 'If you'd like an extra discount, just tell me how many "
+                            "- End with: 'If you'd like an extra discount, tell me how many "
                             "units you need and I'll work out the best price for you!'\n\n"
                             f"STORE OFFERS:\n{_offers_text}{_tier_ctx}"
                         )},
@@ -1683,12 +1703,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
                 return _fmt.choices[0].message.content.strip()
             except Exception as _fe:
-                print(f"[OFFER INQUIRY] Format failed: {_fe}")
                 return (
                     f"Here are the current offers, {incoming.sender_name}! 🎉\n\n"
-                    + _offers_text
-                    + _tier_ctx
-                    + "\n\nIf you'd like an extra discount, just tell me how many units you need!"
+                    + _offers_text + _tier_ctx
+                    + "\n\nIf you'd like an extra discount, tell me how many units you need!"
                 )
         else:
             return (
@@ -1696,10 +1714,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 f"Browse our products and I'll confirm the best available price."
             )
 
-    # ── Negotiation bypass for comparison/recommendation ─────────────────────
-    # (is_offer_inquiry already handled above, not needed in this check)
     if quick_parsed.get("is_comparison", False) or quick_parsed.get("is_recommendation", False):
-        print(f"[FOLLOW-UP] is_comparison/recommendation — bypassing negotiation")
         neg_state = None
 
     # ── Case 1: Comparison OR recommendation ───────────────────────────────
