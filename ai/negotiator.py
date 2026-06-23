@@ -221,31 +221,20 @@ async def detect_quantity_change(
     message: str,
     current_quantity: int,
     product_name: str,
-    session_history: list = None,
+    session_history: list = None,   # kept for signature compat but NOT passed to LLM
 ) -> Optional[int]:
     """
     Detects if the customer is asking to CHANGE the quantity already locked
-    into this negotiation — either a relative change ("add 1 more unit",
-    "one more", "add 2 more") or a new absolute number ("make it 6 units",
-    "actually I want 8").
+    into this negotiation.
 
-    Returns the NEW TOTAL quantity, or None if the customer is not asking
-    to change quantity at all (negotiating price, accepting, asking a
-    question, etc).
+    Returns the NEW TOTAL quantity, or None if no change requested.
 
-    WHY THIS EXISTS:
-        Once `quantity` is set in handle_negotiation, later messages are
-        NEVER re-checked for quantity at all — extract_quantity() is only
-        called while quantity is still None. A message like "I want to add
-        1 more unit" was silently falling through to detect_acceptance(),
-        which doesn't know what to do with it either, and on a later turn
-        got misread as accepting the OLD quantity at the OLD price.
-        Confirmed in production: customer asked twice to add 1 unit
-        (4 -> 5, which should unlock the 5% tier), quantity never moved
-        off 4, and the second identical message produced a bogus
-        "We're happy to match your offer" order summary still at 4 units.
-        This check must run BEFORE detect_acceptance / detect_counter_offer
-        so quantity-change intent is never swallowed by them.
+    CRITICAL — NO session_history passed to LLM:
+        Session history contains upsell messages like "Order 2 more units
+        to reach Rs.7,500!". When passed as context, the LLM reads those
+        messages and misinterprets "add 1 more unit" as adding the upsell
+        amount (2) instead of 1, giving wrong totals (1+2=3 instead of 1+1=2).
+        The current_quantity parameter is the ONLY source of truth for state.
     """
     try:
         response = _client.chat.completions.create(
@@ -254,20 +243,21 @@ async def detect_quantity_change(
             temperature = 0,
             messages    = [
                 {"role": "system", "content": (
-                    f"The customer currently has {current_quantity} units of "
-                    f"'{product_name}' in this order.\n"
-                    "Is the customer asking to CHANGE that quantity — adding "
-                    "more, reducing it, or setting a new total?\n"
-                    "If YES, reply with ONLY the NEW TOTAL quantity as an "
-                    f"integer. Example: current is {current_quantity}, "
-                    f"customer says 'add 1 more unit' -> reply "
-                    f"'{current_quantity + 1}'.\n"
-                    "If the customer is NOT asking to change quantity "
-                    "(e.g. negotiating price, accepting an offer, asking "
-                    "an unrelated question), reply with ONLY 'NONE'.\n"
-                    "Reply with ONLY the integer or 'NONE' — nothing else."
+                    f"The customer's order currently has exactly {current_quantity} unit(s) "
+                    f"of '{product_name}'.\n"
+                    f"THIS IS THE ONLY SOURCE OF TRUTH — ignore any other quantities "
+                    f"you may have seen.\n\n"
+                    "If the customer is changing the quantity, reply with the NEW TOTAL.\n"
+                    "Relative changes:\n"
+                    f"  'add 1 more' → {current_quantity + 1}\n"
+                    f"  'add 2 more' → {current_quantity + 2}\n"
+                    f"  'remove 1'   → {current_quantity - 1}\n"
+                    "Absolute changes:\n"
+                    f"  'make it 5'  → 5\n"
+                    f"  'I want 8'   → 8\n"
+                    "If NOT a quantity change (price negotiation, acceptance, question): reply NONE.\n"
+                    "Reply with ONLY the integer or NONE."
                 )},
-            ] + (session_history[-4:] if session_history else []) + [
                 {"role": "user", "content": message},
             ],
         )
@@ -926,57 +916,28 @@ async def handle_negotiation(
             rounds     += 1
 
             # ── Check if this is ONLY a quantity change (no discount request) ──
-            # CRITICAL: Do NOT pass session_history here.
-            # is_negotiation_request() with history sees the upsell message
-            # ("Order 2 more to unlock 5% off!") and incorrectly marks "add 2
-            # more units" as a negotiation request. Judge the message alone.
-            _is_discount_req = True  # safe default — only flip if LLM says NO
+            # "add 4 more units" = just adding units → auto-apply tier, show order summary
+            # "add 5 units and give me discount" = qty change + discount → negotiation
+            _is_discount_req = False
             try:
-                _disc_check = _client.chat.completions.create(
-                    model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
-                    messages=[
-                        {"role": "system", "content": (
-                            "Does this message ask for a LOWER PRICE, discount, or price negotiation?\n"
-                            "Answer YES only if the message explicitly requests a lower price or discount.\n"
-                            "Answer NO if the message ONLY changes quantity (add/remove units).\n"
-                            "YES: 'add 5 units with a discount', 'give me a better price for 3 units'\n"
-                            "NO: 'add 2 more units', 'ok then add 4 units', 'make it 9 units'\n"
-                            "Reply ONLY 'YES' or 'NO'."
-                        )},
-                        {"role": "user", "content": msg},
-                    ],
-                )
-                _is_discount_req = "YES" in _disc_check.choices[0].message.content.strip().upper()
-            except Exception as _dce:
-                print(f"[NEGOTIATOR] discount-check failed: {_dce}")
-                # On failure, assume pure quantity change — better to show order
-                # summary than accidentally enter negotiation for a simple add
-                _is_discount_req = False
+                from ai.intent_router import is_negotiation_request as _inr
+                _is_discount_req = await _inr(msg, session_history)
+            except Exception:
+                # Fallback: keyword check
+                _discount_words = ["discount", "offer", "less", "cheaper", "reduce", "lower",
+                                   "negotiate", "better price", "extra off"]
+                _is_discount_req = any(w in msg.lower() for w in _discount_words)
 
             if not _is_discount_req:
                 # Pure quantity change — auto-apply the applicable global offer tier
-                order_value = price_num * quantity
-
-                # Fetch tiers if empty (may not have been passed from main.py yet)
-                _active_tiers = tiers
-                if not _active_tiers:
-                    try:
-                        from db.session_store import get_tenant_offers as _gto
-                        import asyncio as _aio
-                        _to = await _gto(incoming.tenant_id if hasattr(incoming, "tenant_id") else "")
-                        if _to and _to.get("offers_text"):
-                            _active_tiers = parse_global_offer_tiers(_to["offers_text"])
-                            print(f"[NEGOTIATOR] Fetched tiers from tenant_offers for qty change")
-                    except Exception as _te:
-                        print(f"[NEGOTIATOR] tenant_offers fetch failed: {_te}")
-
-                _, auto_disc = get_applicable_tier(order_value, _active_tiers) if _active_tiers else (0, 0)
+                order_value  = price_num * quantity
+                _, auto_disc = get_applicable_tier(order_value, tiers) if tiers else (0, 0)
 
                 if auto_disc > 0:
                     # Tier applies — compute auto-offer price
                     auto_price = round(price_num * (1 - auto_disc / 100), 2)
                     auto_total = round(auto_price * quantity, 2)
-                    next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
+                    next_t     = get_next_tier(order_value, tiers) if tiers else None
                     upsell     = ""
                     if next_t:
                         units_to_next = max(1, int((next_t[0] - order_value) / price_num) + 1)

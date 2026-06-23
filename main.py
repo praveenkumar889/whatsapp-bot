@@ -1319,12 +1319,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             messages=[
                 {"role": "system", "content": (
                     "Does this message ask to SEE available store offers, discounts or schemes?\n"
+                    "Is the customer asking to SEE or KNOW ABOUT available store offers/discounts?\n"
                     "YES: 'any offers?', 'currently is there any offers?', 'any offers for this?', "
-                    "'any offers for Olivia Stem?', 'is there any offer?', 'any discount?', "
-                    "'what are the offers?', 'any deals?', 'any scheme?'\n"
-                    "NO: 'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
-                    "'can we go with 2000 each'\n"
-                    "Rule: 'offer'/'discount'/'scheme'/'deal' → YES. Specific Rs. counter → NO.\n"
+                    "'any offers for Olivia Stem?', 'is there any offer?', 'what are the offers?', "
+                    "'any deals?', 'any scheme?', 'what discounts do you have?'\n"
+                    "NO — these are price counter-offers or negotiation requests:\n"
+                    "'can I get for Rs.2000', 'give me 10% off', 'I want it for 1500', "
+                    "'can I get any additional discount?', 'can you give more discount?', "
+                    "'I want extra discount', 'can we go with 2000 each'\n"
+                    "KEY: 'can I GET discount' = NO (negotiation). 'are there any offers?' = YES (inquiry).\n"
                     "Reply ONLY 'YES' or 'NO'."
                 )},
                 {"role": "user", "content": incoming.text},
@@ -2339,23 +2342,18 @@ PRODUCT DATA:
                     quantity_unit  = parsed_unit,
                 )
                 print(f"[ORDER] Saved pending order to DB: {product_name} x {parsed_qty}")
-
-                # Always clear stale negotiation state and save fresh state with correct
-                # quantity. This prevents stale quantity (e.g. 4 from a previous session)
-                # from making "add 2 more units" calculate 4+2=6 instead of 2+2=4.
-                await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
-                _fresh_neg = {
-                    "product_name":      product_name,
-                    "price_num":         float(product_context.get("list_price") or 0),
-                    "quantity":          int(parsed_qty),
-                    "rounds":            0,
-                    "awaiting_quantity": False,
-                }
+                # If global offer was auto-applied, save the offer price in negotiation state
+                # so if customer asks for extra discount, negotiation starts FROM the offer price
                 if product_context.get("auto_offer_applied") and product_context.get("auto_offer_unit_price"):
-                    _fresh_neg["auto_offer_unit_price"] = product_context["auto_offer_unit_price"]
-                    _fresh_neg["auto_offer_disc_pct"]   = product_context.get("auto_offer_disc_pct", 0)
-                await save_negotiation_state(incoming.tenant_id, incoming.session_id, _fresh_neg)
-                print(f"[OFFER] Saved fresh neg_state qty={parsed_qty} product={product_name}")
+                    await save_negotiation_state(incoming.tenant_id, incoming.session_id, {
+                        "product_name":          product_name,
+                        "price_num":             product_context.get("list_price", 0),
+                        "auto_offer_unit_price": product_context["auto_offer_unit_price"],
+                        "quantity":              int(parsed_qty),
+                        "rounds":                0,
+                        "awaiting_quantity":     False,
+                    })
+                    print(f"[OFFER] Saved auto-offer baseline Rs.{product_context['auto_offer_unit_price']:,.2f} for future negotiation")
             except Exception as e:
                 print(f"[ORDER] Failed to save pending order: {e}")
 
