@@ -199,6 +199,8 @@ async def process_message(data: dict):
     incoming.website       = tenant_info.get("website")
     incoming.upi_id        = tenant_info.get("upi_id")
     incoming.account_name  = tenant_info.get("account_name")
+    # GST rate from tenant config (default 18% for LED lighting / standard goods)
+    incoming.gst_rate      = float(tenant_info.get("gst_rate") or 18) / 100
 
     print(f"\n{'─'*60}")
     print(f"[{incoming.trace_id}] {incoming.sender_name} ({incoming.sender_phone})")
@@ -258,7 +260,7 @@ async def process_message(data: dict):
         session_history = await get_session_history(
             tenant_id  = incoming.tenant_id,
             session_id = incoming.session_id,
-            limit      = 10,
+            limit      = 20,  # fetch more; each LLM call slices what it needs
         )
 
         # ── Step 5: Save to DB (Save-First rule) ──────────────────────────
@@ -340,8 +342,8 @@ async def process_message(data: dict):
                         _a = _ng_result["agreed_price"]
                         _q = _ng_result["quantity"]
                         _sub  = round(_a * _q, 2)
-                        _gst  = round(_sub * 0.18, 2)
-                        _tot  = round(_sub * 1.18, 2)
+                        _gst  = round(_sub * incoming.gst_rate, 2)
+                        _tot  = round(_sub * (1 + incoming.gst_rate), 2)
                         await save_negotiation_state(
                             incoming.tenant_id, incoming.session_id,
                             {**_ng_result["state"],
@@ -355,7 +357,7 @@ async def process_message(data: dict):
                             f"• *Quantity:* {_q} units",
                             f"• *Price per unit:* Rs.{_a:,.0f}",
                             f"• *Subtotal:* Rs.{_sub:,.0f}",
-                            f"• *GST (18%):* Rs.{_gst:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.0f}",
                             f"• *Total Payable:* Rs.{_tot:,.0f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
@@ -422,8 +424,8 @@ async def process_message(data: dict):
                 agreed_price    = float(neg_state_check.get("last_offer_price", 0))
                 quantity        = int(neg_state_check.get("quantity", 0))
                 total_price     = round(agreed_price * quantity, 2)
-                total_with_gst  = round(total_price * 1.18, 2)
-                gst_amount      = round(total_price * 0.18, 2)
+                total_with_gst  = round(total_price * (1 + incoming.gst_rate), 2)
+                gst_amount      = round(total_price * incoming.gst_rate, 2)
                 awaiting_conf   = neg_state_check.get("awaiting_invoice_confirmation", False)
 
                 if product_name and agreed_price > 0 and quantity > 0:
@@ -464,7 +466,7 @@ async def process_message(data: dict):
                             f"• *Quantity:* {quantity} units",
                             f"• *Price per unit:* Rs.{agreed_price:,.0f}",
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
-                            f"• *GST (18%):* Rs.{gst_amount:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.0f}",
                             f"• *Total Payable:* Rs.{total_with_gst:,.0f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
@@ -1032,7 +1034,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: li
     """
     product_names = [p.get("product_name") or p.get("name") or "" for p in selection]
     try:
-        recent_history = session_history[-4:] if session_history else []
+        recent_history = session_history[-6:] if session_history else []
         response = _ai_client.chat.completions.create(
             model       = AZURE_OPENAI_DEPLOYMENT,
             max_tokens  = 200,
@@ -1157,7 +1159,7 @@ async def _get_active_product_context(
                     + "\n".join(f"- {name}" for name in product_names)
                     + "\n\nReturn ONLY valid JSON array. No explanation, no markdown."
                 )},
-                *session_history[-6:],
+                *session_history[-10:],
                 {"role": "user", "content": "Which products from the list were recently being discussed?"},
             ],
         )
@@ -1478,8 +1480,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         agreed  = result["agreed_price"]
                         qty     = result["quantity"]
                         sub     = round(agreed * qty, 2)
-                        gst     = round(sub * 0.18, 2)
-                        total   = round(sub * 1.18, 2)
+                        gst     = round(sub * incoming.gst_rate, 2)
+                        total   = round(sub * (1 + incoming.gst_rate), 2)
                         updated = {
                             **result["state"],
                             "awaiting_invoice_confirmation": True,
@@ -1497,7 +1499,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             f"• *Quantity:* {qty} units",
                             f"• *Price per unit:* Rs.{agreed:,.0f}",
                             f"• *Subtotal:* Rs.{sub:,.0f}",
-                            f"• *GST (18%):* Rs.{gst:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.0f}",
                             f"• *Total Payable:* Rs.{total:,.0f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
@@ -2051,7 +2053,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # ── Case 3: Pure follow-up — scan bot history ───────────────────────────
     if not matched_product and session_history:
         recent_bot_msgs = [
-            m["content"] for m in session_history[-6:]
+            m["content"] for m in session_history[-10:]
             if m.get("role") == "assistant"
         ]
         combined_bot_text = " ".join(recent_bot_msgs).lower()
@@ -2232,7 +2234,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         except Exception as _aoe:
             print(f"[OFFER] Auto-apply failed: {_aoe}")
 
-    recent_history = session_history[-6:] if session_history else []
+    recent_history = session_history[-10:] if session_history else []
 
     try:
         _t_final_start = time.monotonic()
@@ -2632,7 +2634,7 @@ async def _is_invoice_confirmation_request(incoming, session_history: list) -> b
         return False
 
     recent_bot_msgs = [
-        m["content"] for m in session_history[-4:]
+        m["content"] for m in session_history[-6:]
         if m.get("role") == "assistant"
     ]
     if not recent_bot_msgs:

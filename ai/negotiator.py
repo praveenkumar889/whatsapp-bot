@@ -925,6 +925,154 @@ async def handle_negotiation(
             offer       = calculate_offer(price_num, quantity, tiers)
             rounds     += 1
 
+            # ── Check if this is ONLY a quantity change (no discount request) ──
+            # CRITICAL: Do NOT pass session_history here.
+            # is_negotiation_request() with history sees the upsell message
+            # ("Order 2 more to unlock 5% off!") and incorrectly marks "add 2
+            # more units" as a negotiation request. Judge the message alone.
+            _is_discount_req = True  # safe default — only flip if LLM says NO
+            try:
+                _disc_check = _client.chat.completions.create(
+                    model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
+                    messages=[
+                        {"role": "system", "content": (
+                            "Does this message ask for a LOWER PRICE, discount, or price negotiation?\n"
+                            "Answer YES only if the message explicitly requests a lower price or discount.\n"
+                            "Answer NO if the message ONLY changes quantity (add/remove units).\n"
+                            "YES: 'add 5 units with a discount', 'give me a better price for 3 units'\n"
+                            "NO: 'add 2 more units', 'ok then add 4 units', 'make it 9 units'\n"
+                            "Reply ONLY 'YES' or 'NO'."
+                        )},
+                        {"role": "user", "content": msg},
+                    ],
+                )
+                _is_discount_req = "YES" in _disc_check.choices[0].message.content.strip().upper()
+            except Exception as _dce:
+                print(f"[NEGOTIATOR] discount-check failed: {_dce}")
+                # On failure, assume pure quantity change — better to show order
+                # summary than accidentally enter negotiation for a simple add
+                _is_discount_req = False
+
+            if not _is_discount_req:
+                # Pure quantity change — auto-apply the applicable global offer tier
+                order_value = price_num * quantity
+
+                # Fetch tiers if empty (may not have been passed from main.py yet)
+                _active_tiers = tiers
+                if not _active_tiers:
+                    try:
+                        from db.session_store import get_tenant_offers as _gto
+                        import asyncio as _aio
+                        _to = await _gto(incoming.tenant_id if hasattr(incoming, "tenant_id") else "")
+                        if _to and _to.get("offers_text"):
+                            _active_tiers = parse_global_offer_tiers(_to["offers_text"])
+                            print(f"[NEGOTIATOR] Fetched tiers from tenant_offers for qty change")
+                    except Exception as _te:
+                        print(f"[NEGOTIATOR] tenant_offers fetch failed: {_te}")
+
+                _, auto_disc = get_applicable_tier(order_value, _active_tiers) if _active_tiers else (0, 0)
+
+                if auto_disc > 0:
+                    # Tier applies — compute auto-offer price
+                    auto_price = round(price_num * (1 - auto_disc / 100), 2)
+                    auto_total = round(auto_price * quantity, 2)
+                    next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
+                    upsell     = ""
+                    if next_t:
+                        units_to_next = max(1, int((next_t[0] - order_value) / price_num) + 1)
+                        upsell = (f"\nOrder {units_to_next} more unit(s) to reach "
+                                  f"Rs.{next_t[0]:,} and unlock {next_t[1]}% off!")
+
+                    try:
+                        resp = _client.chat.completions.create(
+                            model=AZURE_OPENAI_DEPLOYMENT, max_tokens=250, temperature=0.3,
+                            messages=[
+                                {"role": "system", "content": (
+                                    f"You are a sales assistant for {biz_name}.\n"
+                                    f"Customer updated to {quantity} units.\n"
+                                    f"The store's {auto_disc}% offer tier is now automatically applied.\n"
+                                    f"Show a clean order summary:\n"
+                                    f"- Product: {product_name}\n"
+                                    f"- Quantity: {quantity} units\n"
+                                    f"- Regular price: Rs.{price_num:,.2f}/unit\n"
+                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.2f}/unit\n"
+                                    f"- Total: Rs.{auto_total:,.2f}\n"
+                                    f"{'Upsell: ' + upsell if upsell else ''}\n"
+                                    f"End with 'Please confirm and we'll process your order!'\n"
+                                    f"Address as {sender}. Use *bold* for prices."
+                                )},
+                                {"role": "user", "content": msg},
+                            ],
+                        )
+                        reply = resp.choices[0].message.content.strip()
+                    except Exception:
+                        reply = (
+                            f"Updated order for {sender}! 🎉\n\n"
+                            f"• *Product:* {product_name}\n"
+                            f"• *Quantity:* {quantity} units\n"
+                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.2f}/unit*\n"
+                            f"• *Total: Rs.{auto_total:,.2f}*\n"
+                            + (upsell if upsell else "")
+                            + "\n\nPlease confirm and we'll process your order! 🎉"
+                        )
+
+                    return {
+                        "reply":        reply,
+                        "state":        _updated_state(
+                            quantity              = quantity,
+                            rounds                = rounds,
+                            last_offer_price      = auto_price,
+                            floor_price           = floor_price,
+                            awaiting_quantity     = False,
+                            auto_offer_unit_price = auto_price,
+                            auto_offer_disc_pct   = auto_disc,
+                        ),
+                        "order_ready":  False,
+                        "escalate":     False,
+                        "agreed_price": None,
+                        "quantity":     quantity,
+                    }
+                else:
+                    # No tier applies for this order value — show plain order summary
+                    try:
+                        resp = _client.chat.completions.create(
+                            model=AZURE_OPENAI_DEPLOYMENT, max_tokens=200, temperature=0.3,
+                            messages=[
+                                {"role": "system", "content": (
+                                    f"Customer updated order to {quantity} units of {product_name}.\n"
+                                    f"Show a clean order summary: Rs.{price_num:,.2f}/unit × {quantity} "
+                                    f"= Rs.{price_num * quantity:,.2f} total.\n"
+                                    f"No extra discount applies yet.\n"
+                                    f"End with 'Please confirm and we'll process your order!'\n"
+                                    f"Address as {sender}. Use *bold* for prices."
+                                )},
+                                {"role": "user", "content": msg},
+                            ],
+                        )
+                        reply = resp.choices[0].message.content.strip()
+                    except Exception:
+                        reply = (
+                            f"Updated order for {sender}:\n"
+                            f"• *{product_name}* × {quantity} units\n"
+                            f"• Rs.{price_num:,.2f}/unit × {quantity} = *Rs.{price_num * quantity:,.2f}*\n\n"
+                            f"Please confirm and we'll process your order! 🎉"
+                        )
+                    return {
+                        "reply":        reply,
+                        "state":        _updated_state(
+                            quantity          = quantity,
+                            rounds            = rounds,
+                            last_offer_price  = price_num,
+                            floor_price       = floor_price,
+                            awaiting_quantity = False,
+                        ),
+                        "order_ready":  False,
+                        "escalate":     False,
+                        "agreed_price": None,
+                        "quantity":     quantity,
+                    }
+
+            # Discount was also requested with the quantity change → fall through to negotiation
             if not offer["has_discount"]:
                 reply = await _reply_no_discount(
                     sender, product_name, price_num, regular_price,
