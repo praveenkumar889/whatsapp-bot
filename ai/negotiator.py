@@ -773,13 +773,6 @@ async def handle_negotiation(
 
     floor_disc  = get_negotiation_floor_disc(tiers)
     floor_price = round(price_num * (1 - floor_disc / 100), 2)
-    # NOTE: floor_price is always based on price_num (list price), not negotiation_baseline.
-    # This ensures floor stays fixed regardless of which auto-tier is active.
-    # IMPORTANT: When negotiation_baseline < floor_price (customer is at top tier
-    # and their auto-offer is already below the standard floor), we set a new
-    # effective floor 3% below the baseline. This gives a small negotiation window
-    # while never going below the auto-offer price.
-    # e.g. auto_price=712, floor=735 → effective_floor = 712 × 0.97 = 691
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
     # negotiation_baseline: the starting price for discount offers.
@@ -796,12 +789,17 @@ async def handle_negotiation(
     )
     if negotiation_baseline < price_num:
         print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
-    # If auto-offer is below the standard floor (top tier scenario),
-    # use 97% of negotiation_baseline as the effective floor.
-    # This prevents negative gap and keeps all counter-offers below the auto-offer.
-    if negotiation_baseline < floor_price:
-        floor_price = round(negotiation_baseline * 0.97, 2)
-        print(f"[NEGOTIATOR] Top-tier: effective floor adjusted to Rs.{floor_price:,.2f} (97% of baseline)")
+
+    # ── CORRECT FLOOR CALCULATION ──────────────────────────────────────────
+    # Business rule: floor = auto_offer × 0.95 (5% negotiation window)
+    # The old floor (price_num × second_tier%) was designed for negotiating FROM
+    # the list price. But when an auto-offer is already applied, the customer
+    # is entitled to negotiate below THAT price — not just the standard floor.
+    # e.g. auto_offer=2294 (8%), floor = 2294 × 0.95 = 2179
+    # This is ALWAYS used when an auto_offer exists, regardless of tiers.
+    if negotiation_baseline < price_num:
+        floor_price = round(negotiation_baseline * 0.95, 2)
+        print(f"[NEGOTIATOR] Floor = auto_baseline × 95% = Rs.{floor_price:,.2f}")
 
     def _updated_state(**kwargs) -> dict:
         return {
@@ -997,16 +995,13 @@ async def handle_negotiation(
 
                 if auto_disc > 0:
                     # Tier applies — compute auto-offer price FROM TRUE LIST PRICE (price_num)
-                    # Never use negotiation_baseline here — that would compound discounts.
-                    # Round to nearest rupee so display price × qty = subtotal exactly
+                    # Round to integer so display × qty = subtotal exactly (no rounding confusion).
                     auto_price = round(price_num * (1 - auto_disc / 100))
-                    # CRITICAL: update negotiation_baseline to the fresh auto_price.
-                    # negotiation_baseline was set at function entry from the PREVIOUS
-                    # state's auto_offer (e.g. 735 for 5%) — but now quantity changed
-                    # and a higher tier applies (e.g. 8% = 712). All subsequent
-                    # negotiation must start from 712, not 735.
+                    auto_total = round(auto_price * quantity)
+                    # Update negotiation_baseline to the fresh auto_price for this quantity.
+                    # Without this, baseline stays at the PREVIOUS tier's price
+                    # (e.g. 5% = Rs.2368) when a higher tier now applies (8% = Rs.2294).
                     negotiation_baseline = auto_price
-                    auto_total = round(auto_price * quantity, 2)
                     next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
                     upsell     = ""
                     if next_t:
@@ -1025,9 +1020,9 @@ async def handle_negotiation(
                                     f"Show a clean order summary:\n"
                                     f"- Product: {product_name}\n"
                                     f"- Quantity: {quantity} units\n"
-                                    f"- Our price: Rs.{price_num:,.0f}/unit (list price)\n"
-                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.0f}/unit\n"
-                                    f"- Total: Rs.{auto_total:,.0f}\n"
+                                    f"- Our price: Rs.{price_num:,.2f}/unit (list price)\n"
+                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.2f}/unit\n"
+                                    f"- Total: Rs.{auto_total:,.2f}\n"
                                     f"{'Upsell: ' + upsell if upsell else ''}\n"
                                     f"End with 'Please confirm and we'll process your order!'\n"
                                     "IMPORTANT: If the Upsell line above is empty, do NOT invent "
@@ -1044,9 +1039,9 @@ async def handle_negotiation(
                             f"Updated order for {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
-                            f"• *List price:* Rs.{price_num:,.0f}/unit\n"
-                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.0f}/unit*\n"
-                            f"• *Total: Rs.{auto_total:,.0f}*\n"
+                            f"• *List price:* Rs.{price_num:,.2f}/unit\n"
+                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.2f}/unit*\n"
+                            f"• *Total: Rs.{auto_total:,.2f}*\n"
                             + (upsell if upsell else "")
                             + "\n\nPlease confirm and we'll process your order! 🎉"
                         )
@@ -1274,54 +1269,6 @@ async def handle_negotiation(
             rounds += 1
             is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
             last_offer = negotiation_state.get("last_offer_price", price_num)
-
-            # Check if customer already has the auto-offer price (store discount)
-            # If floor_price <= auto_offer_unit_price, there is NO room to negotiate
-            # because the store discount IS the floor. Tell customer directly.
-            _auto_offer = negotiation_state.get("auto_offer_unit_price")
-            _already_at_best = (
-                _auto_offer is not None
-                and round(floor_price, 2) <= round(float(_auto_offer), 2)
-            )
-            if _already_at_best and counter_price < float(_auto_offer):
-                # Customer already has the store discount applied.
-                # Negotiating further would go below the store's own floor.
-                _ao = float(_auto_offer)
-                _ao_total = round(_ao * quantity, 2)
-                _ao_disc  = negotiation_state.get("auto_offer_disc_pct", 0)
-                try:
-                    _resp = _client.chat.completions.create(
-                        model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0.3,
-                        messages=[
-                            {"role": "system", "content": (
-                                f"You are a sales assistant for {biz_name}.\n"
-                                f"The customer already has the store's best automatic discount of {_ao_disc}% applied.\n"
-                                f"Their current price is Rs.{_ao:,.0f}/unit (total Rs.{_ao_total:,.0f} for {quantity} units of {product_name}).\n"
-                                f"They are asking for Rs.{counter_price:,.0f}/unit which is below our minimum.\n"
-                                "Politely explain that they already have our best available store discount applied.\n"
-                                "This is the lowest price available — we cannot go below the store offer price.\n"
-                                "Do NOT mention escalation or sales team. Max 3 lines. Use *bold* for prices.\n"
-                                f"Address as {sender}."
-                            )},
-                            {"role": "user", "content": "Explain they already have the best price."},
-                        ],
-                    )
-                    reply = _resp.choices[0].message.content.strip()
-                except Exception:
-                    reply = (
-                        f"{sender}, you already have our store's best {_ao_disc}% discount applied — "
-                        f"*Rs.{_ao:,.0f}/unit* is the lowest available price for {product_name}. 🙏\n\n"
-                        f"Total for {quantity} units: *Rs.{_ao_total:,.0f}*.\n"
-                        f"Would you like to proceed at this price?"
-                    )
-                return {
-                    "reply":        reply,
-                    "state":        _updated_state(quantity=quantity, rounds=rounds),
-                    "order_ready":  False,
-                    "escalate":     False,
-                    "agreed_price": None,
-                    "quantity":     quantity,
-                }
 
             if counter_price < floor_price:
                 if is_final:

@@ -357,8 +357,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {_q} units",
                             f"• *Price per unit:* Rs.{_a:,.0f}",
                             f"• *Subtotal:* Rs.{_sub:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.0f}",
-                            f"• *Total Payable:* Rs.{_tot:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.2f}",
+                            f"• *Total Payable:* Rs.{_tot:,.2f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ])
@@ -399,8 +399,12 @@ async def process_message(data: dict):
                         messages    = [
                             {"role": "system", "content": (
                                 "The bot just showed an order summary and asked the customer to confirm. "
-                                "Is the customer's message a confirmation to place the order "
-                                "(e.g. 'confirm', 'proceed', 'yes', 'ok', 'sure', 'do it')?\n"
+                                "Is the customer's message a confirmation to place the order?\n"
+                                "YES examples: 'confirm', 'proceed', 'yes', 'ok', 'sure', 'do it', "
+                                "'ok confirm', 'yes confirm', 'yes proceed', 'ok proceed', "
+                                "'ok then proceed with the order', 'proceed with the order', "
+                                "'go ahead', 'go ahead with the order', 'yes go ahead', 'sure proceed'\n"
+                                "NO examples: 'can I get cheaper', 'any more discount', 'add more units'\n"
                                 "Reply ONLY 'YES' or 'NO'."
                             )},
                             {"role": "user", "content": incoming.text},
@@ -474,8 +478,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {quantity} units",
                             f"• *Price per unit:* Rs.{agreed_price:,.0f}",
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.0f}",
-                            f"• *Total Payable:* Rs.{total_with_gst:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.2f}",
+                            f"• *Total Payable:* Rs.{total_with_gst:,.2f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
@@ -1515,43 +1519,18 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             incoming.tenant_id, incoming.session_id, updated
                         )
                         print(f"[NEGOTIATOR] Showing order summary before invoice")
-                        # Build discount label and next-tier upsell for confirmation summary
-                        _auto_disc_pct  = result["state"].get("auto_offer_disc_pct", 0)
-                        _list_price     = price_num  # always the true list price
-                        _disc_label     = ""
-                        _upsell_line    = ""
-                        if _auto_disc_pct and _list_price and agreed < _list_price:
-                            _disc_label = f"• *Store offer {int(_auto_disc_pct)}% applied:* Rs.{agreed:,.0f}/unit"
-                            # Calculate next tier upsell
-                            try:
-                                from ai.negotiator import parse_global_offer_tiers, get_next_tier
-                                _go = result["state"].get("global_offers", "")
-                                if _go:
-                                    _tiers = parse_global_offer_tiers(_go)
-                                    _order_val = agreed * qty
-                                    _next_t = get_next_tier(_order_val, _tiers)
-                                    if _next_t:
-                                        _units_needed = max(1, int((_next_t[0] - _order_val) / agreed) + 1)
-                                        _upsell_line = f"\nOrder {_units_needed} more unit(s) to reach Rs.{_next_t[0]:,} and unlock {_next_t[1]}% off!"
-                            except Exception as _ue:
-                                print(f"[CONFIRM] Upsell calc failed: {_ue}")
                         lines = [
                             f"Great news, {incoming.sender_name}! Here's your order summary:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {qty} units",
-                            f"• *List price:* Rs.{_list_price:,.0f}/unit" if _disc_label else f"• *Price per unit:* Rs.{agreed:,.0f}",
-                        ]
-                        if _disc_label:
-                            lines.append(_disc_label)
-                        lines += [
+                            f"• *Price per unit:* Rs.{agreed:,.0f}",
                             f"• *Subtotal:* Rs.{sub:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.0f}",
-                            f"• *Total Payable:* Rs.{total:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.2f}",
+                            f"• *Total Payable:* Rs.{total:,.2f}",
+                            "",
+                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
-                        if _upsell_line:
-                            lines.append(_upsell_line)
-                        lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
                         return "\n".join(lines)
 
                     if result["escalate"]:
