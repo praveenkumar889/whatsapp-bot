@@ -1037,20 +1037,21 @@ async def handle_negotiation(
                             quantity              = quantity,
                             rounds                = rounds,
                             # last_offer_price = negotiation_baseline, NOT auto_price.
-                            # auto_price is the store's automatic tier discount — it is
-                            # NOT a negotiated concession. If we store auto_price here,
-                            # any counter-offer by the customer ("can I get 350?") makes
-                            # the negotiator think it already gave 359 as a concession
-                            # and starts the midway response from the wrong baseline.
+                            # Kept as list price so any subsequent counter-offer
+                            # ("can I get cheaper?") negotiates from the correct baseline.
                             last_offer_price      = negotiation_baseline,
                             floor_price           = floor_price,
                             awaiting_quantity     = False,
                             auto_offer_unit_price = auto_price,
                             auto_offer_disc_pct   = auto_disc,
                         ),
-                        "order_ready":  False,
+                        # order_ready=True so main.py sets awaiting_invoice_confirmation=True
+                        # and locks in the correct qty+auto_price immediately.
+                        # Without this, "yes proceed" re-enters handle_negotiation as a
+                        # fresh turn, picks up stale state, and shows wrong qty/price.
+                        "order_ready":  True,
                         "escalate":     False,
-                        "agreed_price": None,
+                        "agreed_price": auto_price,
                         "quantity":     quantity,
                     }
                 else:
