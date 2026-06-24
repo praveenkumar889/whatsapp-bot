@@ -357,8 +357,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {_q} units",
                             f"• *Price per unit:* Rs.{_a:,.0f}",
                             f"• *Subtotal:* Rs.{_sub:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.0f}",
-                            f"• *Total Payable:* Rs.{_tot:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.2f}",
+                            f"• *Total Payable:* Rs.{_tot:,.2f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ])
@@ -491,8 +491,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {quantity} units",
                             f"• *Price per unit:* Rs.{agreed_price:,.0f}",
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.0f}",
-                            f"• *Total Payable:* Rs.{total_with_gst:,.0f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.2f}",
+                            f"• *Total Payable:* Rs.{total_with_gst:,.2f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
