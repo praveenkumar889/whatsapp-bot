@@ -544,15 +544,11 @@ async def _reply_first_offer(
             messages    = [
                 {"role": "system", "content": (
                     f"You are a friendly sales assistant for {biz_name}.\n"
-                    "Present a quantity-based price offer to the customer.\n"
-                    "MUST show all 3 prices clearly:\n"
-                    "  1. Original price (regular_price)\n"
-                    "  2. Already discounted price (price_num) with its % off\n"
-                    f"  3. Final offer price with the EXACT extra discount % ({actual_offer_pct}% extra off)\n"
-                    "ALWAYS include the discount percentage next to the final price.\n"
-                    "Example format: *Rs.X* per unit (*Y% extra off*)\n"
-                    "Be warm and concise (max 6 lines). Use *bold* for prices and percentages.\n"
-                    "End with: 'Would you like to proceed at this price?'\n"
+                    "Present a special price offer to the customer. Be warm and concise (max 4 lines).\n"
+                    "Show ONLY the offer price and total — do NOT mention or calculate any percentage.\n"
+                    "Do NOT say things like '1.7% extra off' or 'X% discount' — just show the price.\n"
+                    "Format: 'We can offer [product] at *Rs.X per unit* (total *Rs.Y* for N units). Shall we proceed?'\n"
+                    "Use *bold* for prices only.\n"
                     f"Address customer as {sender}. Do NOT reveal the floor price.\n\n"
                     f"OFFER DETAILS:\n{context}"
                 )},
@@ -1009,9 +1005,9 @@ async def handle_negotiation(
                                     f"Show a clean order summary:\n"
                                     f"- Product: {product_name}\n"
                                     f"- Quantity: {quantity} units\n"
-                                    f"- Our price: Rs.{price_num:,.2f}/unit (list price)\n"
-                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.2f}/unit\n"
-                                    f"- Total: Rs.{auto_total:,.2f}\n"
+                                    f"- Our price: Rs.{price_num:,.0f}/unit (list price)\n"
+                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.0f}/unit\n"
+                                    f"- Total: Rs.{auto_total:,.0f}\n"
                                     f"{'Upsell: ' + upsell if upsell else ''}\n"
                                     f"End with 'Please confirm and we'll process your order!'\n"
                                     "IMPORTANT: If the Upsell line above is empty, do NOT invent "
@@ -1028,9 +1024,9 @@ async def handle_negotiation(
                             f"Updated order for {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
-                            f"• *List price:* Rs.{price_num:,.2f}/unit\n"
-                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.2f}/unit*\n"
-                            f"• *Total: Rs.{auto_total:,.2f}*\n"
+                            f"• *List price:* Rs.{price_num:,.0f}/unit\n"
+                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.0f}/unit*\n"
+                            f"• *Total: Rs.{auto_total:,.0f}*\n"
                             + (upsell if upsell else "")
                             + "\n\nPlease confirm and we'll process your order! 🎉"
                         )
@@ -1039,10 +1035,9 @@ async def handle_negotiation(
                         "reply":        reply,
                         "state":        _updated_state(
                             quantity              = quantity,
-                            # Reset rounds to 0: auto-tier is a fresh negotiation
-                            # starting point. Previous rounds from an earlier
-                            # negotiation must not carry over — otherwise
-                            # rounds=4 → is_final=True on the very first counter.
+                            # Reset rounds=0: auto-tier is always a fresh negotiation.
+                            # Stale rounds from a previous session cause is_final=True
+                            # on the very first counter-offer (BUG-072).
                             rounds                = 0,
                             last_offer_price      = negotiation_baseline,
                             floor_price           = floor_price,
