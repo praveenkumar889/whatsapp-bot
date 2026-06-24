@@ -732,7 +732,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
             lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
 
     lines.append(
-        f"\nReply with the product name to know more or place an order."
+        f"\nReply with the product *number* or *name* to know more or place an order."
     )
 
     summary_text = "\n".join(lines)
@@ -1316,6 +1316,41 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         None → not a product follow-up, let call_graphrag_api() handle it
     """
     selection = await get_graphrag_product_selection(incoming.tenant_id, incoming.session_id)
+
+    # ── NUMBER SELECTION RESOLVER ──────────────────────────────────────────
+    # When a numbered product list was shown (e.g. "1. Veeta LED ... 13. Lumax ..."),
+    # the products are stored in selection in display order (index+1 = number).
+    # Resolve "13", "#13", "option 13", "I want 13", "tell me about 13", etc.
+    # to the actual product name BEFORE any other processing.
+    # This must run even if selection is None (will just skip silently).
+    if selection and len(selection) > 1:
+        import re as _re
+        _txt = incoming.text.strip()
+        # Match: bare number, #N, option N, product N, item N, select N,
+        # "I want N", "give me N", "tell me about N", "number N", etc.
+        _num_match = _re.search(
+            r'(?:^|\b)(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?(\d+)(?:\b|$)',
+            _txt, _re.IGNORECASE
+        )
+        if _num_match:
+            _n = int(_num_match.group(1))
+            if 1 <= _n <= len(selection):
+                _chosen = selection[_n - 1]
+                _chosen_name = _chosen.get("product_name") or _chosen.get("name", "")
+                if _chosen_name:
+                    # Check the message is actually a quantity, not a product selection
+                    # ("I want 2 units" should not match product #2)
+                    # NOTE: "numbers?" removed — "number 13" = product #13, not a qty
+                    _qty_words = _re.search(
+                        r'\b(units?|pieces?|pcs?|qty|quantity|of them)\b',
+                        _txt, _re.IGNORECASE
+                    )
+                    if not _qty_words:
+                        print(f"[NUMBER-SELECT] '{_txt}' → #{_n} → '{_chosen_name}'")
+                        incoming.text = _chosen_name
+                        # Also strip remaining context so downstream sees just the name
+                        # e.g. "tell me about 13" → "Lumax Lens Led Street Light"
+
     if not selection:
         from db.session_store import get_last_discussed_product
         last_prod = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
