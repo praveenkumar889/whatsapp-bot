@@ -1316,41 +1316,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         None → not a product follow-up, let call_graphrag_api() handle it
     """
     selection = await get_graphrag_product_selection(incoming.tenant_id, incoming.session_id)
-
-    # ── NUMBER SELECTION RESOLVER ──────────────────────────────────────────
-    # When a numbered product list was shown (e.g. "1. Veeta LED ... 13. Lumax ..."),
-    # the products are stored in selection in display order (index+1 = number).
-    # Resolve "13", "#13", "option 13", "I want 13", "tell me about 13", etc.
-    # to the actual product name BEFORE any other processing.
-    # This must run even if selection is None (will just skip silently).
-    if selection and len(selection) > 1:
-        import re as _re
-        _txt = incoming.text.strip()
-        # Match: bare number, #N, option N, product N, item N, select N,
-        # "I want N", "give me N", "tell me about N", "number N", etc.
-        _num_match = _re.search(
-            r'(?:^|\b)(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?(\d+)(?:\b|$)',
-            _txt, _re.IGNORECASE
-        )
-        if _num_match:
-            _n = int(_num_match.group(1))
-            if 1 <= _n <= len(selection):
-                _chosen = selection[_n - 1]
-                _chosen_name = _chosen.get("product_name") or _chosen.get("name", "")
-                if _chosen_name:
-                    # Check the message is actually a quantity, not a product selection
-                    # ("I want 2 units" should not match product #2)
-                    # NOTE: "numbers?" removed — "number 13" = product #13, not a qty
-                    _qty_words = _re.search(
-                        r'\b(units?|pieces?|pcs?|qty|quantity|of them)\b',
-                        _txt, _re.IGNORECASE
-                    )
-                    if not _qty_words:
-                        print(f"[NUMBER-SELECT] '{_txt}' → #{_n} → '{_chosen_name}'")
-                        incoming.text = _chosen_name
-                        # Also strip remaining context so downstream sees just the name
-                        # e.g. "tell me about 13" → "Lumax Lens Led Street Light"
-
     if not selection:
         from db.session_store import get_last_discussed_product
         last_prod = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
@@ -1362,6 +1327,64 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             print(f"[FOLLOW-UP] No active selection found - loaded last discussed product from DB: {last_prod}")
         else:
             return None
+
+    # ── NUMBER SELECTION RESOLVER ────────────────────────────────────────────
+    # Runs BEFORE any LLM call. When a numbered product list was shown,
+    # resolve number references to product names while preserving intent context.
+    #
+    # Handles:
+    #   "compare 11 and 12"       → "compare Figo Solar Wall Light and Nyla Solar Wall Light"
+    #   "give me details about 11" → "give me details about Figo Solar Wall Light"
+    #   "11" (bare)               → "Figo Solar Wall Light"
+    #   "I want 2 units"          → skip (qty context)
+    if selection and len(selection) > 1:
+        import re as _re
+        _txt = incoming.text.strip()
+        _qty_ctx = bool(_re.search(
+            r'\b(units?|pieces?|pcs?|qty|quantity|of them)\b', _txt, _re.IGNORECASE
+        ))
+        if not _qty_ctx:
+            # Extract all numbers from the message
+            _all_nums = _re.findall(r'(?<![\d])(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?(\d+)(?![\d])', _txt, _re.IGNORECASE)
+            _in_range = [int(n) for n in _all_nums if 1 <= int(n) <= len(selection)]
+
+            if len(_in_range) >= 2:
+                # COMPARISON: "compare 11 and 12", "11 vs 12"
+                _p1 = selection[_in_range[0]-1].get("product_name") or selection[_in_range[0]-1].get("name", "")
+                _p2 = selection[_in_range[1]-1].get("product_name") or selection[_in_range[1]-1].get("name", "")
+                if _p1 and _p2:
+                    # Detect compare/vs/versus/difference keywords
+                    _is_compare = bool(_re.search(
+                        r'\b(compare|vs\.?|versus|difference|better|which)\b',
+                        _txt, _re.IGNORECASE
+                    ))
+                    if _is_compare:
+                        print(f"[NUMBER-SELECT] Compare #{_in_range[0]} vs #{_in_range[1]}: '{_p1}' vs '{_p2}'")
+                        incoming.text = f"compare {_p1} and {_p2}"
+                    else:
+                        # "11 or 12", "11 and 12" without explicit compare word
+                        print(f"[NUMBER-SELECT] Multi-select #{_in_range[0]} & #{_in_range[1]}: defaulting to compare")
+                        incoming.text = f"compare {_p1} and {_p2}"
+
+            elif len(_in_range) == 1:
+                _n = _in_range[0]
+                _chosen = selection[_n - 1]
+                _chosen_name = _chosen.get("product_name") or _chosen.get("name", "")
+                if _chosen_name:
+                    # Replace just the number (and its optional prefix) in the message,
+                    # preserving any intent context before/after it.
+                    # "give me details about 11" → "give me details about Figo Solar..."
+                    # "order 11" → "order Figo Solar..."
+                    # "11" → "Figo Solar..."
+                    _replaced = _re.sub(
+                        r'(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?' + str(_n) + r'(?!\d)',
+                        _chosen_name,
+                        _txt,
+                        count=1,
+                        flags=_re.IGNORECASE
+                    ).strip()
+                    print(f"[NUMBER-SELECT] #{_n} → '{_chosen_name}' | '{_txt}' → '{_replaced}'")
+                    incoming.text = _replaced
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
     # ── Negotiation check ────────────────────────────────────────────────────
@@ -2091,7 +2114,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
             # Unique marker text that ONLY appears on a freshly-shown product list —
             # guarantees this number is the customer's first reply to THAT exact list.
-            bot_just_showed_list = "reply with the product name to know more or place an order" in last_bot_msg
+            bot_just_showed_list = "reply with the product" in last_bot_msg and ("name" in last_bot_msg or "number" in last_bot_msg)
 
             bot_asked_quantity = (
                 "how many units" in last_bot_msg
