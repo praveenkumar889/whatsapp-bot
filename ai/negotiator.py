@@ -790,17 +790,6 @@ async def handle_negotiation(
     if negotiation_baseline < price_num:
         print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
 
-    # ── CORRECT FLOOR CALCULATION ──────────────────────────────────────────
-    # Business rule: floor = auto_offer × 0.95 (5% negotiation window)
-    # The old floor (price_num × second_tier%) was designed for negotiating FROM
-    # the list price. But when an auto-offer is already applied, the customer
-    # is entitled to negotiate below THAT price — not just the standard floor.
-    # e.g. auto_offer=2294 (8%), floor = 2294 × 0.95 = 2179
-    # This is ALWAYS used when an auto_offer exists, regardless of tiers.
-    if negotiation_baseline < price_num:
-        floor_price = round(negotiation_baseline * 0.95, 2)
-        print(f"[NEGOTIATOR] Floor = auto_baseline × 95% = Rs.{floor_price:,.2f}")
-
     def _updated_state(**kwargs) -> dict:
         return {
             **negotiation_state,
@@ -995,13 +984,9 @@ async def handle_negotiation(
 
                 if auto_disc > 0:
                     # Tier applies — compute auto-offer price FROM TRUE LIST PRICE (price_num)
-                    # Round to integer so display × qty = subtotal exactly (no rounding confusion).
-                    auto_price = round(price_num * (1 - auto_disc / 100))
-                    auto_total = round(auto_price * quantity)
-                    # Update negotiation_baseline to the fresh auto_price for this quantity.
-                    # Without this, baseline stays at the PREVIOUS tier's price
-                    # (e.g. 5% = Rs.2368) when a higher tier now applies (8% = Rs.2294).
-                    negotiation_baseline = auto_price
+                    # Never use negotiation_baseline here — that would compound discounts.
+                    auto_price = round(price_num * (1 - auto_disc / 100), 2)
+                    auto_total = round(auto_price * quantity, 2)
                     next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
                     upsell     = ""
                     if next_t:
@@ -1242,8 +1227,8 @@ async def handle_negotiation(
             # Customer not yet at max tier — move midway toward floor as goodwill
             rounds   += 1
             is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
-            new_offer = max(round((last_offer + floor_price) / 2, 2), floor_price)
-            total     = round(new_offer * quantity, 2)
+            new_offer = max(round((last_offer + floor_price) / 2), round(floor_price))
+            total     = new_offer * quantity
             print(f"[NEGOTIATOR] More discount — Rs.{last_offer} → Rs.{new_offer} (floor=Rs.{floor_price})")
             reply = await _reply_counter_offer(
                 sender, product_name, last_offer, new_offer,
@@ -1274,7 +1259,8 @@ async def handle_negotiation(
                 if is_final:
                     # Rounds exhausted AND below floor — now reveal minimum firmly.
                     # Floor is only shown after full negotiation, never on first ask.
-                    floor_total = round(floor_price * quantity, 2)
+                    floor_price = round(floor_price)  # integer for display consistency
+                    floor_total = floor_price * quantity
                     try:
                         firm_resp = _client.chat.completions.create(
                             model       = AZURE_OPENAI_DEPLOYMENT,
@@ -1319,8 +1305,8 @@ async def handle_negotiation(
                 else:
                     # Below floor but rounds NOT exhausted — keep negotiating.
                     # Move midway between last_offer and floor WITHOUT revealing floor.
-                    new_offer = max(round((last_offer + floor_price) / 2, 2), floor_price)
-                    total     = round(new_offer * quantity, 2)
+                    new_offer = max(round((last_offer + floor_price) / 2), round(floor_price))
+                    total     = new_offer * quantity
                     print(f"[NEGOTIATOR] Below floor, rounds={rounds}/{MAX_NEGOTIATION_ROUNDS} — countering Rs.{new_offer} (floor Rs.{floor_price} not revealed yet)")
                     reply = await _reply_counter_offer(
                         sender, product_name, counter_price, new_offer,
@@ -1328,9 +1314,9 @@ async def handle_negotiation(
                     )
             else:
                 # Above floor — meet midway between last_offer and customer price
-                midway    = round((last_offer + counter_price) / 2, 2)
-                new_offer = max(midway, floor_price)
-                total     = round(new_offer * quantity, 2)
+                midway    = round((last_offer + counter_price) / 2)
+                new_offer = max(midway, round(floor_price))
+                total     = new_offer * quantity
                 reply     = await _reply_counter_offer(
                     sender, product_name, counter_price, new_offer,
                     quantity, total, rounds, is_final, biz_name

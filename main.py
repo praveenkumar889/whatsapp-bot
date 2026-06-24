@@ -357,8 +357,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {_q} units",
                             f"• *Price per unit:* Rs.{_a:,.0f}",
                             f"• *Subtotal:* Rs.{_sub:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.2f}",
-                            f"• *Total Payable:* Rs.{_tot:,.2f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.0f}",
+                            f"• *Total Payable:* Rs.{_tot:,.0f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ])
@@ -400,11 +400,11 @@ async def process_message(data: dict):
                             {"role": "system", "content": (
                                 "The bot just showed an order summary and asked the customer to confirm. "
                                 "Is the customer's message a confirmation to place the order?\n"
-                                "YES examples: 'confirm', 'proceed', 'yes', 'ok', 'sure', 'do it', "
+                                "YES: 'confirm', 'proceed', 'yes', 'ok', 'sure', 'do it', "
                                 "'ok confirm', 'yes confirm', 'yes proceed', 'ok proceed', "
                                 "'ok then proceed with the order', 'proceed with the order', "
                                 "'go ahead', 'go ahead with the order', 'yes go ahead', 'sure proceed'\n"
-                                "NO examples: 'can I get cheaper', 'any more discount', 'add more units'\n"
+                                "NO: 'can I get cheaper', 'any more discount', 'add more units'\n"
                                 "Reply ONLY 'YES' or 'NO'."
                             )},
                             {"role": "user", "content": incoming.text},
@@ -426,14 +426,27 @@ async def process_message(data: dict):
 
             if neg_state_check and neg_state_check.get("quantity") and neg_state_check.get("last_offer_price"):
                 product_name    = neg_state_check.get("product_name")
-                # Prefer auto_offer_unit_price when available — it is the actual
-                # discounted price shown to the customer (e.g. 8% off = Rs.2440.76).
-                # last_offer_price is now the list price (negotiation_baseline) after
-                # the Bug3 fix and should NOT be used as the invoice price for
-                # auto-tier orders. Only fall back to last_offer_price when no
-                # auto_offer_unit_price exists (i.e. a pure negotiated deal).
+                # Price resolution — must distinguish two cases:
+                # Case A: Auto-tier only (rounds=0, no negotiation happened)
+                #         → use auto_offer_unit_price (e.g. 8% = Rs.2294)
+                # Case B: Negotiation rounds happened (rounds > 0)
+                #         → use last_offer_price (the actual negotiated price, e.g. Rs.1229)
+                #         NEVER use auto_offer_unit_price here — it is the PRE-negotiation
+                #         price and using it overcharges the customer by the negotiated amount.
+                _neg_rounds     = int(neg_state_check.get("rounds", 0))
                 _auto_price     = neg_state_check.get("auto_offer_unit_price")
-                agreed_price    = float(_auto_price) if _auto_price else float(neg_state_check.get("last_offer_price", 0))
+                _last_price     = neg_state_check.get("last_offer_price")
+                if _neg_rounds > 0 and _last_price:
+                    # Negotiation happened — last_offer_price IS the agreed negotiated price
+                    agreed_price = float(_last_price)
+                    print(f"[CONFIRM] Using negotiated price Rs.{agreed_price:,.0f} (rounds={_neg_rounds})")
+                elif _auto_price:
+                    # No negotiation — use auto-tier price
+                    agreed_price = float(_auto_price)
+                    print(f"[CONFIRM] Using auto-tier price Rs.{agreed_price:,.0f} (no negotiation)")
+                else:
+                    agreed_price = float(_last_price or 0)
+                    print(f"[CONFIRM] Fallback to last_offer_price Rs.{agreed_price:,.0f}")
                 quantity        = int(neg_state_check.get("quantity", 0))
                 total_price     = round(agreed_price * quantity, 2)
                 total_with_gst  = round(total_price * (1 + incoming.gst_rate), 2)
@@ -478,8 +491,8 @@ async def process_message(data: dict):
                             f"• *Quantity:* {quantity} units",
                             f"• *Price per unit:* Rs.{agreed_price:,.0f}",
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
-                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.2f}",
-                            f"• *Total Payable:* Rs.{total_with_gst:,.2f}",
+                            f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.0f}",
+                            f"• *Total Payable:* Rs.{total_with_gst:,.0f}",
                             "",
                             "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
