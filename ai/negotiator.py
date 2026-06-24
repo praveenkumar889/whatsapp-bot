@@ -789,9 +789,6 @@ async def handle_negotiation(
     )
     if negotiation_baseline < price_num:
         print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
-    # Business rule: floor = auto_offer × 0.95 (5% negotiation window).
-    # The standard floor (price_num × second_tier%) equals auto_price when
-    # the same tier is active → gap=0 → no negotiation room.
     if negotiation_baseline < price_num:
         floor_price = round(negotiation_baseline * 0.95, 2)
         print(f"[NEGOTIATOR] Floor = auto_baseline × 95% = Rs.{floor_price:,.2f}")
@@ -1264,10 +1261,8 @@ async def handle_negotiation(
 
             if counter_price < floor_price:
                 if is_final:
-                    # Rounds exhausted AND below floor — now reveal minimum firmly.
-                    floor_price = round(floor_price)  # integer for display consistency
+                    floor_price = round(floor_price)
                     floor_total = floor_price * quantity
-                    # BUG-062: if floor already revealed, give brief message
                     _prev_last_offer = round(negotiation_state.get("last_offer_price", price_num))
                     if _prev_last_offer == floor_price:
                         _brief = (

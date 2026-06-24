@@ -1532,6 +1532,21 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             incoming.tenant_id, incoming.session_id, updated
                         )
                         print(f"[NEGOTIATOR] Showing order summary before invoice")
+                        # BUG-071: add next-tier upsell to confirmation summary
+                        _conf_upsell = ""
+                        try:
+                            from ai.negotiator import parse_global_offer_tiers as _pt71, get_next_tier as _gnt71
+                            _go71 = result["state"].get("global_offers", "")
+                            if _go71:
+                                _tiers71  = _pt71(_go71)
+                                _ov71     = agreed * qty
+                                _next71   = _gnt71(_ov71, _tiers71)
+                                if _next71:
+                                    _u71 = max(1, int((_next71[0] - _ov71) / agreed) + 1)
+                                    _conf_upsell = (f"\nOrder {_u71} more unit(s) to reach "
+                                                    f"Rs.{_next71[0]:,} and unlock {_next71[1]}% off!")
+                        except Exception as _e71:
+                            print(f"[CONFIRM] Upsell calc failed: {_e71}")
                         lines = [
                             f"Great news, {incoming.sender_name}! Here's your order summary:",
                             "",
@@ -1541,9 +1556,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             f"• *Subtotal:* Rs.{sub:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.2f}",
                             f"• *Total Payable:* Rs.{total:,.2f}",
-                            "",
-                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
+                        if _conf_upsell:
+                            lines.append(_conf_upsell)
+                        lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
                         return "\n".join(lines)
 
                     if result["escalate"]:
