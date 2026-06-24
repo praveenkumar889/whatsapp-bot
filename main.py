@@ -872,17 +872,6 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         data = response.json()
         print(f"[GRAPHRAG] Response received — keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
-        # Diagnostic: log what response_text looks like so we can debug GraphRAG issues
-        _rt_preview = response_text
-        if isinstance(_rt_preview, list):
-            print(f"[GRAPHRAG] response_text: list of {len(_rt_preview)} items, first type={type(_rt_preview[0]).__name__ if _rt_preview else 'empty'}")
-        elif isinstance(_rt_preview, dict):
-            print(f"[GRAPHRAG] response_text: dict status={_rt_preview.get('status','?')} collections={len(_rt_preview.get('available_collections',[]))}")
-        elif isinstance(_rt_preview, str):
-            print(f"[GRAPHRAG] response_text: string {len(_rt_preview)} chars: '{_rt_preview[:80]}'")
-        else:
-            print(f"[GRAPHRAG] response_text: {type(_rt_preview).__name__} = {str(_rt_preview)[:80]}")
-
         # Store raw response on incoming so pipeline can save it to DB
         import json as _json
         try:
@@ -892,6 +881,16 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         response_text = data.get("response_text", [])
         response_text = _coerce_pythonic_dict(response_text)
+        # Diagnostic: log what response_text looks like
+        _rt = response_text
+        if isinstance(_rt, list):
+            print(f"[GRAPHRAG] response_text: list of {len(_rt)} items, first={type(_rt[0]).__name__ if _rt else 'empty'}")
+        elif isinstance(_rt, dict):
+            print(f"[GRAPHRAG] response_text: dict status={_rt.get('status','?')} collections={len(_rt.get('available_collections',[]))}")
+        elif isinstance(_rt, str):
+            print(f"[GRAPHRAG] response_text: string {len(_rt)} chars: '{_rt[:80]}'")
+        else:
+            print(f"[GRAPHRAG] response_text: {type(_rt).__name__}")
 
         # ── Clarification request response ──────────────────────────────────
         # GraphRAG can return a THIRD response shape: a dict with
@@ -1625,7 +1624,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 (_msg_lower in pname and len(_msg_lower) > 6) or
                 (pname in _msg_lower and len(pname) > 6)
             ):
-                if p.get("_is_collection"):
                 if p.get("_is_collection"):
                     clean_name     = p.get("product_name") or p.get("name")
                     original_query = p.get("_original_query", "")
