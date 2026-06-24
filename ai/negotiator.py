@@ -789,6 +789,12 @@ async def handle_negotiation(
     )
     if negotiation_baseline < price_num:
         print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
+    # Business rule: floor = auto_offer × 0.95 (5% negotiation window).
+    # The standard floor (price_num × second_tier%) equals auto_price when
+    # the same tier is active → gap=0 → no negotiation room.
+    if negotiation_baseline < price_num:
+        floor_price = round(negotiation_baseline * 0.95, 2)
+        print(f"[NEGOTIATOR] Floor = auto_baseline × 95% = Rs.{floor_price:,.2f}")
 
     def _updated_state(**kwargs) -> dict:
         return {
@@ -983,10 +989,11 @@ async def handle_negotiation(
                 _, auto_disc = get_applicable_tier(order_value, _active_tiers) if _active_tiers else (0, 0)
 
                 if auto_disc > 0:
-                    # Tier applies — compute auto-offer price FROM TRUE LIST PRICE (price_num)
-                    # Never use negotiation_baseline here — that would compound discounts.
-                    auto_price = round(price_num * (1 - auto_disc / 100), 2)
-                    auto_total = round(auto_price * quantity, 2)
+                    # Round to integer so display × qty = subtotal exactly.
+                    auto_price = round(price_num * (1 - auto_disc / 100))
+                    auto_total = round(auto_price * quantity)
+                    # Update baseline to the fresh auto_price for this quantity.
+                    negotiation_baseline = auto_price
                     next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
                     upsell     = ""
                     if next_t:
@@ -1258,11 +1265,9 @@ async def handle_negotiation(
             if counter_price < floor_price:
                 if is_final:
                     # Rounds exhausted AND below floor — now reveal minimum firmly.
-                    # Floor is only shown after full negotiation, never on first ask.
                     floor_price = round(floor_price)  # integer for display consistency
                     floor_total = floor_price * quantity
-                    # BUG-062: if floor was already revealed in a previous turn,
-                    # give a short final message instead of repeating the full one.
+                    # BUG-062: if floor already revealed, give brief message
                     _prev_last_offer = round(negotiation_state.get("last_offer_price", price_num))
                     if _prev_last_offer == floor_price:
                         _brief = (
@@ -1273,10 +1278,8 @@ async def handle_negotiation(
                         return {
                             "reply":        _brief,
                             "state":        _updated_state(quantity=quantity, rounds=rounds, last_offer_price=floor_price),
-                            "order_ready":  False,
-                            "escalate":     False,
-                            "agreed_price": None,
-                            "quantity":     quantity,
+                            "order_ready":  False, "escalate": False,
+                            "agreed_price": None, "quantity":  quantity,
                         }
                     try:
                         firm_resp = _client.chat.completions.create(
@@ -1310,7 +1313,7 @@ async def handle_negotiation(
                         "reply":        reply,
                         "state":        _updated_state(
                             quantity          = quantity,
-                            rounds            = 1,
+                            rounds            = rounds,  # preserve actual round count
                             last_offer_price  = floor_price,
                             awaiting_quantity = False,
                         ),
