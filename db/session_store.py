@@ -218,6 +218,7 @@ async def save_outbound_message(
     text: str,
     media_url: Optional[str] = None,
     original_type: str = "text",
+    region: str = "india",
 ) -> bool:
     """Saves an outbound message (bot reply) to the database."""
     import uuid
@@ -229,7 +230,7 @@ async def save_outbound_message(
             "channel":             "whatsapp",
             "timestamp_unix":      int(datetime.now(timezone.utc).timestamp()),
             "tenant_id":           tenant_id,
-            "region":              "india",
+            "region":              region,
             "direction":           "outbound",
             "original_type":       original_type,
             "text":                text,

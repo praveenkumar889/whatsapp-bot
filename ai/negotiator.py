@@ -478,8 +478,11 @@ async def _reply_no_discount(
     discount_pct: int,
     quantity: int,
     biz_name: str,
+    min_units: int = 5,
 ) -> str:
-    """Tells customer no extra discount for < 5 units but mentions how to qualify."""
+    """Tells customer no extra discount below min_units threshold but mentions how to qualify.
+    min_units is derived from the first offer tier, not hardcoded.
+    """
     try:
         response = _client.chat.completions.create(
             model       = AZURE_OPENAI_DEPLOYMENT,
@@ -490,8 +493,8 @@ async def _reply_no_discount(
                     f"You are a friendly sales assistant for {biz_name}.\n"
                     f"Customer wants {quantity} unit(s) of *{product_name}*.\n"
                     f"Current price: Rs.{price_num:,.0f} (already {discount_pct}% off Rs.{regular_price:,.0f})\n"
-                    "For orders below 5 units, no additional discount is available.\n"
-                    "However, mention that buying 5+ units qualifies for extra discounts.\n"
+                    f"For orders below {min_units} units, no additional discount is available.\n"
+                    f"However, mention that buying {min_units}+ units qualifies for extra discounts.\n"
                     "Be warm, honest, and helpful. Max 4 lines.\n"
                     f"Address customer as {sender}. Use *bold* for prices."
                 )},
@@ -505,7 +508,7 @@ async def _reply_no_discount(
         return (
             f"{sender}, for {quantity} unit(s) the price is *Rs.{price_num:,.0f}* per unit "
             f"(Total: *Rs.{total:,.0f}*).\n\n"
-            f"💡 Buy 5+ units to unlock extra discounts!\n\n"
+            f"💡 Buy {min_units}+ units to unlock extra discounts!\n\n"
             f"Would you like to proceed at this price?"
         )
 
@@ -771,6 +774,21 @@ async def handle_negotiation(
     floor_price = round(price_num * (1 - floor_disc / 100), 2)
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
+    # negotiation_baseline: the starting price for discount offers.
+    # When a tier was already auto-applied (e.g. 5% off → Rs.2,469/unit),
+    # further negotiation starts FROM that discounted price.
+    # CRITICAL: price_num is NEVER changed — it stays as the true list price
+    # so floor_price, regular_price labels, and quantity-change recalculations
+    # always use the real price and never compound discounts.
+    _saved_auto = negotiation_state.get("auto_offer_unit_price")
+    negotiation_baseline = (
+        float(_saved_auto)
+        if _saved_auto and float(_saved_auto) < price_num
+        else price_num
+    )
+    if negotiation_baseline < price_num:
+        print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
+
     def _updated_state(**kwargs) -> dict:
         return {
             **negotiation_state,
@@ -805,10 +823,11 @@ async def handle_negotiation(
         offer = calculate_offer(price_num, quantity, tiers)
 
         if not offer["has_discount"]:
-            # Less than 5 units — no extra discount
+            # Derive minimum units from first tier threshold — not hardcoded
+            _min_units = max(1, int(tiers[0][0] / price_num) + 1) if tiers and price_num > 0 else 5
             reply = await _reply_no_discount(
                 sender, product_name, price_num, regular_price,
-                graphrag_discount_pct, quantity, biz_name
+                graphrag_discount_pct, quantity, biz_name, min_units=_min_units
             )
             return {
                 "reply":        reply,
@@ -826,8 +845,9 @@ async def handle_negotiation(
 
         # Qualifies for tier discount — present first offer
         rounds += 1
+        offer = calculate_offer(negotiation_baseline, quantity, tiers)
         reply = await _reply_first_offer(
-            sender, product_name, price_num, regular_price,
+            sender, product_name, negotiation_baseline, regular_price,
             graphrag_discount_pct, offer, biz_name
         )
         return {
@@ -907,7 +927,11 @@ async def handle_negotiation(
     # Step 3/4 so a quantity-change request is never misread as acceptance or
     # a price counter-offer using the stale quantity.
     if had_existing_quantity:
-        new_quantity = await detect_quantity_change(msg, quantity, product_name, session_history)
+        # CRITICAL: do NOT pass session_history here.
+        # History contains upsell messages like "Order 2 more to reach Rs.7,500!"
+        # which poison the LLM into using the wrong relative base.
+        # current_quantity is the only source of truth.
+        new_quantity = await detect_quantity_change(msg, quantity, product_name)
         if new_quantity:
             print(f"[NEGOTIATOR] Quantity change detected: {quantity} -> {new_quantity}")
             quantity    = new_quantity
@@ -925,11 +949,14 @@ async def handle_negotiation(
                     model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
                     messages=[
                         {"role": "system", "content": (
-                            "Does this message ask for a LOWER PRICE, discount, or negotiation?\n"
-                            "YES: 'give me a discount', 'can I get extra off', "
-                            "'reduce the price', 'any additional discount'\n"
-                            "NO: 'add 2 more units', 'ok then add 4 units', "
-                            "'make it 9 units', 'then add 1 more unit', 'add one more'\n"
+                            "Does this message ONLY ask for a LOWER PRICE, discount, or price negotiation?\n"
+                            "Any message that changes quantity — even combined with a discount request —\n"
+                            "is quantity-first: answer NO if the primary action is adding/removing units.\n"
+                            "YES (pure discount): 'give me a discount', 'can I get extra off',\n"
+                            "  'reduce the price', 'any additional discount', 'can you do better?'\n"
+                            "NO (quantity change): 'add 1 more unit', 'ok add 2 more', 'add one more',\n"
+                            "  'make it 9 units', 'then add 1 more unit', 'ok then add 2 units',\n"
+                            "  'remove 1', 'change to 8 units', 'increase to 10'\n"
                             "Reply ONLY 'YES' or 'NO'."
                         )},
                         {"role": "user", "content": msg},
@@ -955,7 +982,8 @@ async def handle_negotiation(
                 _, auto_disc = get_applicable_tier(order_value, _active_tiers) if _active_tiers else (0, 0)
 
                 if auto_disc > 0:
-                    # Tier applies — compute auto-offer price
+                    # Tier applies — compute auto-offer price FROM TRUE LIST PRICE (price_num)
+                    # Never use negotiation_baseline here — that would compound discounts.
                     auto_price = round(price_num * (1 - auto_disc / 100), 2)
                     auto_total = round(auto_price * quantity, 2)
                     next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
@@ -976,7 +1004,7 @@ async def handle_negotiation(
                                     f"Show a clean order summary:\n"
                                     f"- Product: {product_name}\n"
                                     f"- Quantity: {quantity} units\n"
-                                    f"- Regular price: Rs.{price_num:,.2f}/unit\n"
+                                    f"- Our price: Rs.{price_num:,.2f}/unit (list price)\n"
                                     f"- {auto_disc}% store offer applied: Rs.{auto_price:,.2f}/unit\n"
                                     f"- Total: Rs.{auto_total:,.2f}\n"
                                     f"{'Upsell: ' + upsell if upsell else ''}\n"
@@ -992,6 +1020,7 @@ async def handle_negotiation(
                             f"Updated order for {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
+                            f"• *List price:* Rs.{price_num:,.2f}/unit\n"
                             f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.2f}/unit*\n"
                             f"• *Total: Rs.{auto_total:,.2f}*\n"
                             + (upsell if upsell else "")
@@ -1056,9 +1085,10 @@ async def handle_negotiation(
 
             # Discount was also requested with the quantity change → fall through to negotiation
             if not offer["has_discount"]:
+                _min_units = max(1, int(tiers[0][0] / price_num) + 1) if tiers and price_num > 0 else 5
                 reply = await _reply_no_discount(
                     sender, product_name, price_num, regular_price,
-                    graphrag_discount_pct, quantity, biz_name
+                    graphrag_discount_pct, quantity, biz_name, min_units=_min_units
                 )
                 return {
                     "reply":        reply,
@@ -1295,20 +1325,21 @@ async def handle_negotiation(
             }
 
     # ── Step 5: First time — present tier offer ───────────────────────────────
-    offer  = calculate_offer(price_num, quantity, tiers)
+    offer  = calculate_offer(negotiation_baseline, quantity, tiers)
     rounds += 1
 
     if not offer["has_discount"]:
+        _min_units = max(1, int(tiers[0][0] / price_num) + 1) if tiers and price_num > 0 else 5
         reply = await _reply_no_discount(
-            sender, product_name, price_num, regular_price,
-            graphrag_discount_pct, quantity, biz_name
+            sender, product_name, negotiation_baseline, regular_price,
+            graphrag_discount_pct, quantity, biz_name, min_units=_min_units
         )
         return {
             "reply":        reply,
             "state":        _updated_state(
                 quantity          = quantity,
                 rounds            = rounds,
-                last_offer_price  = price_num,
+                last_offer_price  = negotiation_baseline,
                 awaiting_quantity = False,
             ),
             "order_ready":  False,
@@ -1318,7 +1349,7 @@ async def handle_negotiation(
         }
 
     reply = await _reply_first_offer(
-        sender, product_name, price_num, regular_price,
+        sender, product_name, negotiation_baseline, regular_price,
         graphrag_discount_pct, offer, biz_name
     )
     return {

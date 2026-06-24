@@ -372,6 +372,7 @@ async def process_message(data: dict):
                             session_id = incoming.session_id,
                             message_id = sent,
                             text       = reply,
+                    region        = incoming.region,
                         )
                         await update_reply(
                             incoming.message_id, reply,
@@ -542,6 +543,7 @@ async def process_message(data: dict):
                         session_id = incoming.session_id,
                         message_id = sent_wamid,
                         text       = chunk,
+                    region        = incoming.region,
                     )
                 else:
                     print(f"[WHATSAPP] Chunk {i+1}/{len(chunks)} failed")
@@ -554,6 +556,7 @@ async def process_message(data: dict):
                     session_id = incoming.session_id,
                     message_id = sent_wamid,
                     text       = reply,
+                    region        = incoming.region,
                 )
 
         if success:
@@ -676,6 +679,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
                     text          = caption,
                     media_url     = img_url,
                     original_type = "image",
+                    region        = incoming.region,
                 )
         else:
             reply_wamid = await send_whatsapp_reply(incoming.session_id, caption)
@@ -686,6 +690,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
                     session_id = incoming.session_id,
                     message_id = reply_wamid,
                     text       = caption,
+                    region        = incoming.region,
                 )
 
     lines = [f"Here are the options for you, {incoming.sender_name}! 💡\n"]
@@ -917,7 +922,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
             print(f"[GRAPHRAG] Empty product list — no matches found")
             return (
                 f"Sorry {incoming.sender_name}, I couldn't find any products matching that. "
-                f"Could you try describing it differently, or browse all products at inventaa.in? 💡"
+                f"Could you try describing it differently, or browse all products at {incoming.website or incoming.biz_name}? 💡"
             )
 
         reply_str = str(response_text).strip() if response_text else str(data)
@@ -976,7 +981,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                 print(f"[GRAPHRAG] Retry did not resolve the error — sending friendly fallback")
                 return (
                     f"Sorry {incoming.sender_name}, I'm having trouble finding that right now. "
-                    f"Could you try rephrasing, or browse all products at inventaa.in? 💡"
+                    f"Could you try rephrasing, or browse all products at {incoming.website or incoming.biz_name}? 💡"
                 )
 
         if len(reply_str) <= 4096:
@@ -1435,13 +1440,13 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 regular_price  = float(cached.get("regular_price") or price_num)
                 discount_pct   = int(cached.get("discount_pct") or 0)
 
-                # Use auto_offer_unit_price as negotiation baseline when present.
-                # When a tier was auto-applied (e.g. 8% → Rs.2,617), negotiation
-                # must start FROM that price, not the original list price.
-                _saved_auto = (neg_state or {}).get("auto_offer_unit_price")
-                if _saved_auto and float(_saved_auto) < price_num:
-                    price_num = float(_saved_auto)
-                    print(f"[NEGOTIATOR] Using auto-offer baseline: Rs.{price_num:,.2f}")
+                # IMPORTANT: price_num must always be the TRUE LIST PRICE from the
+                # product cache. Never overwrite it with auto_offer_unit_price.
+                # auto_offer_unit_price is only used as the negotiation STARTING POINT
+                # inside handle_negotiation — it must NOT corrupt price_num itself,
+                # otherwise every subsequent quantity change re-discounts an already-
+                # discounted price (compounding discount bug) and "regular price" in
+                # the order summary shows the discounted price instead of the real one.
 
                 if price_num > 0:
                     current_state = neg_state or {
@@ -1915,6 +1920,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             text          = caption,
                             media_url     = img,
                             original_type = "image",
+                    region        = incoming.region,
                         )
 
         import json as _j
@@ -2135,6 +2141,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     text          = caption,
                     media_url     = inst_url,
                     original_type = "image",
+                    region        = incoming.region,
                 )
             # Also send text with the installation link
             link_text = (
@@ -2149,6 +2156,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     session_id = incoming.session_id,
                     message_id = link_wamid,
                     text       = link_text,
+                    region        = incoming.region,
                 )
             return "__ALREADY_HANDLED__"  # Sentinel: image+link already sent, skip GraphRAG + LLM reply
 
@@ -2166,6 +2174,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     text          = caption,
                     media_url     = img_url,
                     original_type = "image",
+                    region        = incoming.region,
                 )
 
     product_context = {
