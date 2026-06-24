@@ -248,11 +248,12 @@ async def detect_quantity_change(
                     f"THIS IS THE ONLY SOURCE OF TRUTH — ignore any other quantities "
                     f"you may have seen.\n\n"
                     "If the customer is changing the quantity, reply with the NEW TOTAL.\n"
-                    "Relative changes:\n"
-                    f"  'add 1 more' → {current_quantity + 1}\n"
-                    f"  'add 2 more' → {current_quantity + 2}\n"
-                    f"  'remove 1'   → {current_quantity - 1}\n"
-                    "Absolute changes:\n"
+                    "Relative changes — add the stated number to current:\n"
+                    f"  'add 1 more' → current({current_quantity}) + 1 = {current_quantity + 1}\n"
+                    f"  'add 5 more' → current({current_quantity}) + 5 = {current_quantity + 5}\n"
+                    f"  'add 10 more' → current({current_quantity}) + 10 = {current_quantity + 10}\n"
+                    f"  'remove 1'   → current({current_quantity}) - 1 = {current_quantity - 1}\n"
+                    "Absolute changes — use the stated number directly:\n"
                     f"  'make it 5'  → 5\n"
                     f"  'I want 8'   → 8\n"
                     "If NOT a quantity change (price negotiation, acceptance, question): reply NONE.\n"
@@ -1009,6 +1010,9 @@ async def handle_negotiation(
                                     f"- Total: Rs.{auto_total:,.2f}\n"
                                     f"{'Upsell: ' + upsell if upsell else ''}\n"
                                     f"End with 'Please confirm and we'll process your order!'\n"
+                                    "IMPORTANT: If the Upsell line above is empty, do NOT invent "
+                                    "any upsell message. Do NOT mention free shipping or any other "
+                                    "benefit not explicitly listed in the Upsell line.\n"
                                     f"Address as {sender}. Use *bold* for prices."
                                 )},
                                 {"role": "user", "content": msg},
@@ -1032,7 +1036,13 @@ async def handle_negotiation(
                         "state":        _updated_state(
                             quantity              = quantity,
                             rounds                = rounds,
-                            last_offer_price      = auto_price,
+                            # last_offer_price = negotiation_baseline, NOT auto_price.
+                            # auto_price is the store's automatic tier discount — it is
+                            # NOT a negotiated concession. If we store auto_price here,
+                            # any counter-offer by the customer ("can I get 350?") makes
+                            # the negotiator think it already gave 359 as a concession
+                            # and starts the midway response from the wrong baseline.
+                            last_offer_price      = negotiation_baseline,
                             floor_price           = floor_price,
                             awaiting_quantity     = False,
                             auto_offer_unit_price = auto_price,
