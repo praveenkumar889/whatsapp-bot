@@ -1555,6 +1555,34 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         print(f"[FOLLOW-UP] LLM parsed: {parsed}")
     
     # ── Check if user wants to start a new search ────────────────────────────
+    # ── Guard: if message matches a product in the current selection list,
+    # it is a SELECTION not a new search — even if LLM says is_new_search=True.
+    # Happens when bot displays "Outdoor LED Gate Lamp Lights" and customer
+    # replies with exactly that text. LLM classifies it as a category search
+    # but it is actually selecting item from the list the bot showed.
+    _msg_lower = incoming.text.lower().strip()
+    _selection_names = [
+        (p.get("product_name") or p.get("name") or "").lower().strip()
+        for p in selection
+    ]
+    _matches_selection = any(
+        _msg_lower == name or
+        (_msg_lower in name and len(_msg_lower) > 6) or
+        (name in _msg_lower and len(name) > 6)
+        for name in _selection_names if name
+    )
+    if _matches_selection and parsed.get("is_new_search", False):
+        print(f"[FOLLOW-UP] is_new_search overridden — message matches selection list item: '{incoming.text}'")
+        parsed["is_new_search"] = False
+        # Also set selected_product_name if not already set
+        if not parsed.get("selected_product_name"):
+            for p in selection:
+                pname = (p.get("product_name") or p.get("name") or "").lower().strip()
+                if _msg_lower == pname or (_msg_lower in pname and len(_msg_lower) > 6) or (pname in _msg_lower and len(pname) > 6):
+                    parsed["selected_product_name"] = p.get("product_name") or p.get("name")
+                    print(f"[FOLLOW-UP] Auto-resolved selected_product_name: '{parsed['selected_product_name']}'")
+                    break
+
     if parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] LLM parser identified category search/new search — routing to GraphRAG")
 
@@ -2910,4 +2938,4 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Opt
 
 
 
-        #
+        #s
