@@ -773,6 +773,13 @@ async def handle_negotiation(
 
     floor_disc  = get_negotiation_floor_disc(tiers)
     floor_price = round(price_num * (1 - floor_disc / 100), 2)
+    # NOTE: floor_price is always based on price_num (list price), not negotiation_baseline.
+    # This ensures floor stays fixed regardless of which auto-tier is active.
+    # IMPORTANT: When negotiation_baseline < floor_price (customer is at top tier
+    # and their auto-offer is already below the standard floor), we set a new
+    # effective floor 3% below the baseline. This gives a small negotiation window
+    # while never going below the auto-offer price.
+    # e.g. auto_price=712, floor=735 → effective_floor = 712 × 0.97 = 691
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
     # negotiation_baseline: the starting price for discount offers.
@@ -789,6 +796,12 @@ async def handle_negotiation(
     )
     if negotiation_baseline < price_num:
         print(f"[NEGOTIATOR] Baseline=Rs.{negotiation_baseline:,.2f} (auto-offer), list=Rs.{price_num:,.2f}")
+    # If auto-offer is below the standard floor (top tier scenario),
+    # use 97% of negotiation_baseline as the effective floor.
+    # This prevents negative gap and keeps all counter-offers below the auto-offer.
+    if negotiation_baseline < floor_price:
+        floor_price = round(negotiation_baseline * 0.97, 2)
+        print(f"[NEGOTIATOR] Top-tier: effective floor adjusted to Rs.{floor_price:,.2f} (97% of baseline)")
 
     def _updated_state(**kwargs) -> dict:
         return {
@@ -985,7 +998,14 @@ async def handle_negotiation(
                 if auto_disc > 0:
                     # Tier applies — compute auto-offer price FROM TRUE LIST PRICE (price_num)
                     # Never use negotiation_baseline here — that would compound discounts.
-                    auto_price = round(price_num * (1 - auto_disc / 100), 2)
+                    # Round to nearest rupee so display price × qty = subtotal exactly
+                    auto_price = round(price_num * (1 - auto_disc / 100))
+                    # CRITICAL: update negotiation_baseline to the fresh auto_price.
+                    # negotiation_baseline was set at function entry from the PREVIOUS
+                    # state's auto_offer (e.g. 735 for 5%) — but now quantity changed
+                    # and a higher tier applies (e.g. 8% = 712). All subsequent
+                    # negotiation must start from 712, not 735.
+                    negotiation_baseline = auto_price
                     auto_total = round(auto_price * quantity, 2)
                     next_t     = get_next_tier(order_value, _active_tiers) if _active_tiers else None
                     upsell     = ""
@@ -1005,9 +1025,9 @@ async def handle_negotiation(
                                     f"Show a clean order summary:\n"
                                     f"- Product: {product_name}\n"
                                     f"- Quantity: {quantity} units\n"
-                                    f"- Our price: Rs.{price_num:,.2f}/unit (list price)\n"
-                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.2f}/unit\n"
-                                    f"- Total: Rs.{auto_total:,.2f}\n"
+                                    f"- Our price: Rs.{price_num:,.0f}/unit (list price)\n"
+                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.0f}/unit\n"
+                                    f"- Total: Rs.{auto_total:,.0f}\n"
                                     f"{'Upsell: ' + upsell if upsell else ''}\n"
                                     f"End with 'Please confirm and we'll process your order!'\n"
                                     "IMPORTANT: If the Upsell line above is empty, do NOT invent "
@@ -1024,9 +1044,9 @@ async def handle_negotiation(
                             f"Updated order for {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
-                            f"• *List price:* Rs.{price_num:,.2f}/unit\n"
-                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.2f}/unit*\n"
-                            f"• *Total: Rs.{auto_total:,.2f}*\n"
+                            f"• *List price:* Rs.{price_num:,.0f}/unit\n"
+                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.0f}/unit*\n"
+                            f"• *Total: Rs.{auto_total:,.0f}*\n"
                             + (upsell if upsell else "")
                             + "\n\nPlease confirm and we'll process your order! 🎉"
                         )
