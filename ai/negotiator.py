@@ -1039,10 +1039,11 @@ async def handle_negotiation(
                         "reply":        reply,
                         "state":        _updated_state(
                             quantity              = quantity,
-                            rounds                = rounds,
-                            # last_offer_price = negotiation_baseline, NOT auto_price.
-                            # Kept as list price so any subsequent counter-offer
-                            # ("can I get cheaper?") negotiates from the correct baseline.
+                            # Reset rounds to 0: auto-tier is a fresh negotiation
+                            # starting point. Previous rounds from an earlier
+                            # negotiation must not carry over — otherwise
+                            # rounds=4 → is_final=True on the very first counter.
+                            rounds                = 0,
                             last_offer_price      = negotiation_baseline,
                             floor_price           = floor_price,
                             awaiting_quantity     = False,
