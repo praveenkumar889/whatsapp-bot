@@ -872,6 +872,16 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         data = response.json()
         print(f"[GRAPHRAG] Response received — keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
+        # Diagnostic: log what response_text looks like so we can debug GraphRAG issues
+        _rt_preview = response_text
+        if isinstance(_rt_preview, list):
+            print(f"[GRAPHRAG] response_text: list of {len(_rt_preview)} items, first type={type(_rt_preview[0]).__name__ if _rt_preview else 'empty'}")
+        elif isinstance(_rt_preview, dict):
+            print(f"[GRAPHRAG] response_text: dict status={_rt_preview.get('status','?')} collections={len(_rt_preview.get('available_collections',[]))}")
+        elif isinstance(_rt_preview, str):
+            print(f"[GRAPHRAG] response_text: string {len(_rt_preview)} chars: '{_rt_preview[:80]}'")
+        else:
+            print(f"[GRAPHRAG] response_text: {type(_rt_preview).__name__} = {str(_rt_preview)[:80]}")
 
         # Store raw response on incoming so pipeline can save it to DB
         import json as _json
@@ -912,12 +922,13 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                 try:
                     synthetic_products = [
                         {
-                            "name":         c,
-                            "sku":          "",
-                            "price_num":    0,
-                            "image_url":    "",
-                            "global_offers": "",
-                            "_is_collection": True,
+                            "name":            c,
+                            "sku":             "",
+                            "price_num":       0,
+                            "image_url":       "",
+                            "global_offers":   "",
+                            "_is_collection":  True,
+                            "_original_query": graphrag_text,
                         }
                         for c in collections
                     ]
@@ -991,7 +1002,8 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                                 try:
                                     _syn2 = [
                                         {"name": c, "sku": "", "price_num": 0,
-                                         "image_url": "", "global_offers": "", "_is_collection": True}
+                                         "image_url": "", "global_offers": "",
+                                         "_is_collection": True, "_original_query": graphrag_text}
                                         for c in collections
                                     ]
                                     await save_graphrag_product_selection(
@@ -1614,11 +1626,22 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 (pname in _msg_lower and len(pname) > 6)
             ):
                 if p.get("_is_collection"):
-                    clean_name = p.get("product_name") or p.get("name")
-                    print(f"[FOLLOW-UP] Collection selected: '{clean_name}' — routing to GraphRAG with clean name")
-                    incoming.text = clean_name
+                if p.get("_is_collection"):
+                    clean_name     = p.get("product_name") or p.get("name")
+                    original_query = p.get("_original_query", "")
+                    # "LED Outdoor Wall Light" alone returns empty from GraphRAG
+                    # because collection names are not valid standalone search queries.
+                    # Combine with the original query that triggered needs_clarification
+                    # so GraphRAG gets both the category context and specific type.
+                    # e.g. original="outdoor lights" + collection="LED Outdoor Wall Light"
+                    #   → query = "outdoor lights LED Outdoor Wall Light"
+                    if original_query and original_query.lower().strip() != clean_name.lower().strip():
+                        incoming.text = f"{original_query} {clean_name}"
+                        print(f"[FOLLOW-UP] Collection '{clean_name}' — combined query: '{incoming.text}'")
+                    else:
+                        incoming.text = clean_name
+                        print(f"[FOLLOW-UP] Collection selected: '{clean_name}' — routing to GraphRAG")
                     return None
-                break
 
     if _matches_selection and parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] is_new_search overridden — message matches selection list item: '{incoming.text}'")
