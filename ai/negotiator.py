@@ -1303,7 +1303,7 @@ async def handle_negotiation(
                         "reply":        reply,
                         "state":        _updated_state(
                             quantity          = quantity,
-                            rounds            = 1,
+                            rounds            = rounds,  # preserve actual round count
                             last_offer_price  = floor_price,
                             awaiting_quantity = False,
                         ),
