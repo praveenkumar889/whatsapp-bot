@@ -422,7 +422,14 @@ async def process_message(data: dict):
 
             if neg_state_check and neg_state_check.get("quantity") and neg_state_check.get("last_offer_price"):
                 product_name    = neg_state_check.get("product_name")
-                agreed_price    = float(neg_state_check.get("last_offer_price", 0))
+                # Prefer auto_offer_unit_price when available — it is the actual
+                # discounted price shown to the customer (e.g. 8% off = Rs.2440.76).
+                # last_offer_price is now the list price (negotiation_baseline) after
+                # the Bug3 fix and should NOT be used as the invoice price for
+                # auto-tier orders. Only fall back to last_offer_price when no
+                # auto_offer_unit_price exists (i.e. a pure negotiated deal).
+                _auto_price     = neg_state_check.get("auto_offer_unit_price")
+                agreed_price    = float(_auto_price) if _auto_price else float(neg_state_check.get("last_offer_price", 0))
                 quantity        = int(neg_state_check.get("quantity", 0))
                 total_price     = round(agreed_price * quantity, 2)
                 total_with_gst  = round(total_price * (1 + incoming.gst_rate), 2)
@@ -2347,8 +2354,17 @@ PRODUCT DATA:
             "quantity": parsed_qty,
         })
 
-        # Save pending order to DB if quantity is specified
-        if parsed_qty is not None:
+        # Save pending order to DB if quantity is specified.
+        # CRITICAL: only save _fresh_neg when there is NO active negotiation state
+        # with a quantity. If neg_state exists (customer is mid-order, e.g. "add 2
+        # more units"), _parse_followup_message extracts the raw number (2) and
+        # _fresh_neg would overwrite quantity=1 with quantity=2 — then
+        # detect_quantity_change sees current=2 and "add 2" → returns 4 instead of 3.
+        # When neg_state exists, handle_negotiation owns the quantity via
+        # detect_quantity_change. We must not interfere here.
+        _active_neg = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+        _has_active_qty = _active_neg and _active_neg.get("quantity")
+        if parsed_qty is not None and not _has_active_qty:
             try:
                 from db.session_store import save_pending_order
                 await save_pending_order(
@@ -2359,9 +2375,8 @@ PRODUCT DATA:
                     quantity_unit  = parsed_unit,
                 )
                 print(f"[ORDER] Saved pending order to DB: {product_name} x {parsed_qty}")
-                # Always clear stale state then save fresh state with correct quantity.
-                # Prevents stale quantity (e.g. 5 from a previous session) from making
-                # "add 1 more unit" compute 5+1=6 instead of correct 4+1=5.
+                # Clear stale state then save fresh state. Only runs for NEW orders
+                # (no existing neg_state quantity) — never for quantity updates.
                 await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                 _fresh_neg = {
                     "product_name":      product_name,
@@ -2377,6 +2392,8 @@ PRODUCT DATA:
                 print(f"[OFFER] Fresh neg_state qty={parsed_qty} auto={_fresh_neg.get('auto_offer_unit_price')}")
             except Exception as e:
                 print(f"[ORDER] Failed to save pending order: {e}")
+        elif parsed_qty is not None and _has_active_qty:
+            print(f"[OFFER] Skipping _fresh_neg save — active neg_state qty={_active_neg.get('quantity')} exists. handle_negotiation owns quantity updates.")
 
         return reply
 
