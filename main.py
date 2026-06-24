@@ -903,13 +903,36 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
             )
             print(f"[GRAPHRAG] Needs clarification — {len(collections)} collections offered")
 
-            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+            # Save collections to PRODUCT_SELECTION so the next message
+            # ("Outdoor LED Gate Lamp Lights", "help me order Gate Lights")
+            # is matched by _try_resolve_product_followup instead of being
+            # sent to GraphRAG as a new query and returning empty results.
+            # Each collection is stored as a synthetic product entry.
+            if collections:
+                try:
+                    synthetic_products = [
+                        {
+                            "name":         c,
+                            "sku":          "",
+                            "price_num":    0,
+                            "image_url":    "",
+                            "global_offers": "",
+                            "_is_collection": True,
+                        }
+                        for c in collections
+                    ]
+                    await save_graphrag_product_selection(
+                        incoming.tenant_id, incoming.session_id, synthetic_products
+                    )
+                    print(f"[GRAPHRAG] Saved {len(collections)} collections to PRODUCT_SELECTION")
+                except Exception as _ce:
+                    print(f"[GRAPHRAG] Failed to save collections to PRODUCT_SELECTION: {_ce}")
+
+            lines = [f"Could you please specify which type you're interested in?"]
             if collections:
                 lines.append("")
-                for i, c in enumerate(collections, 1):
-                    lines.append(f"*{i}.* {c}")
-                lines.append("")
-                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                for c in collections:
+                    lines.append(f"• {c}")
 
             return "\n".join(lines)
 
@@ -964,17 +987,24 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                             return await _send_structured_product_list(incoming, retry_text)
                         elif isinstance(retry_text, dict) and retry_text.get("status") == "needs_clarification":
                             collections = retry_text.get("available_collections", [])
-                            clarify_msg = retry_text.get(
-                                "message",
-                                "Could you let me know which category you're interested in?"
-                            )
-                            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+                            if collections:
+                                try:
+                                    _syn2 = [
+                                        {"name": c, "sku": "", "price_num": 0,
+                                         "image_url": "", "global_offers": "", "_is_collection": True}
+                                        for c in collections
+                                    ]
+                                    await save_graphrag_product_selection(
+                                        incoming.tenant_id, incoming.session_id, _syn2
+                                    )
+                                    print(f"[GRAPHRAG] Retry: saved {len(collections)} collections to PRODUCT_SELECTION")
+                                except Exception as _ce2:
+                                    print(f"[GRAPHRAG] Retry: save failed: {_ce2}")
+                            lines = ["Could you please specify which type you're interested in?"]
                             if collections:
                                 lines.append("")
-                                for i, c in enumerate(collections, 1):
-                                    lines.append(f"*{i}.* {c}")
-                                lines.append("")
-                                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                                for c in collections:
+                                    lines.append(f"• {c}")
                             return "\n".join(lines)
                         elif isinstance(retry_text, str) and len(retry_text) > 100:
                             reply_str = retry_text
@@ -1571,10 +1601,28 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         (name in _msg_lower and len(name) > 6)
         for name in _selection_names if name
     )
+    if _matches_selection:
+        # Check if matched item is a synthetic collection entry (_is_collection=True).
+        # If so, rewrite incoming.text to the clean collection name and return None
+        # so GraphRAG is called with that focused query instead of the full sentence.
+        # e.g. "help me to order Outdoor LED Gate Lamp Lights" -> "Outdoor LED Gate Lamp Lights"
+        for p in selection:
+            pname = (p.get("product_name") or p.get("name") or "").lower().strip()
+            if pname and (
+                _msg_lower == pname or
+                (_msg_lower in pname and len(_msg_lower) > 6) or
+                (pname in _msg_lower and len(pname) > 6)
+            ):
+                if p.get("_is_collection"):
+                    clean_name = p.get("product_name") or p.get("name")
+                    print(f"[FOLLOW-UP] Collection selected: '{clean_name}' — routing to GraphRAG with clean name")
+                    incoming.text = clean_name
+                    return None
+                break
+
     if _matches_selection and parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] is_new_search overridden — message matches selection list item: '{incoming.text}'")
         parsed["is_new_search"] = False
-        # Also set selected_product_name if not already set
         if not parsed.get("selected_product_name"):
             for p in selection:
                 pname = (p.get("product_name") or p.get("name") or "").lower().strip()
