@@ -1255,6 +1255,54 @@ async def handle_negotiation(
             is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
             last_offer = negotiation_state.get("last_offer_price", price_num)
 
+            # Check if customer already has the auto-offer price (store discount)
+            # If floor_price <= auto_offer_unit_price, there is NO room to negotiate
+            # because the store discount IS the floor. Tell customer directly.
+            _auto_offer = negotiation_state.get("auto_offer_unit_price")
+            _already_at_best = (
+                _auto_offer is not None
+                and round(floor_price, 2) <= round(float(_auto_offer), 2)
+            )
+            if _already_at_best and counter_price < float(_auto_offer):
+                # Customer already has the store discount applied.
+                # Negotiating further would go below the store's own floor.
+                _ao = float(_auto_offer)
+                _ao_total = round(_ao * quantity, 2)
+                _ao_disc  = negotiation_state.get("auto_offer_disc_pct", 0)
+                try:
+                    _resp = _client.chat.completions.create(
+                        model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0.3,
+                        messages=[
+                            {"role": "system", "content": (
+                                f"You are a sales assistant for {biz_name}.\n"
+                                f"The customer already has the store's best automatic discount of {_ao_disc}% applied.\n"
+                                f"Their current price is Rs.{_ao:,.0f}/unit (total Rs.{_ao_total:,.0f} for {quantity} units of {product_name}).\n"
+                                f"They are asking for Rs.{counter_price:,.0f}/unit which is below our minimum.\n"
+                                "Politely explain that they already have our best available store discount applied.\n"
+                                "This is the lowest price available — we cannot go below the store offer price.\n"
+                                "Do NOT mention escalation or sales team. Max 3 lines. Use *bold* for prices.\n"
+                                f"Address as {sender}."
+                            )},
+                            {"role": "user", "content": "Explain they already have the best price."},
+                        ],
+                    )
+                    reply = _resp.choices[0].message.content.strip()
+                except Exception:
+                    reply = (
+                        f"{sender}, you already have our store's best {_ao_disc}% discount applied — "
+                        f"*Rs.{_ao:,.0f}/unit* is the lowest available price for {product_name}. 🙏\n\n"
+                        f"Total for {quantity} units: *Rs.{_ao_total:,.0f}*.\n"
+                        f"Would you like to proceed at this price?"
+                    )
+                return {
+                    "reply":        reply,
+                    "state":        _updated_state(quantity=quantity, rounds=rounds),
+                    "order_ready":  False,
+                    "escalate":     False,
+                    "agreed_price": None,
+                    "quantity":     quantity,
+                }
+
             if counter_price < floor_price:
                 if is_final:
                     # Rounds exhausted AND below floor — now reveal minimum firmly.

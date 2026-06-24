@@ -872,6 +872,7 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         data = response.json()
         print(f"[GRAPHRAG] Response received — keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
+
         # Store raw response on incoming so pipeline can save it to DB
         import json as _json
         try:
@@ -881,16 +882,6 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
 
         response_text = data.get("response_text", [])
         response_text = _coerce_pythonic_dict(response_text)
-        # Diagnostic: log what response_text looks like
-        _rt = response_text
-        if isinstance(_rt, list):
-            print(f"[GRAPHRAG] response_text: list of {len(_rt)} items, first={type(_rt[0]).__name__ if _rt else 'empty'}")
-        elif isinstance(_rt, dict):
-            print(f"[GRAPHRAG] response_text: dict status={_rt.get('status','?')} collections={len(_rt.get('available_collections',[]))}")
-        elif isinstance(_rt, str):
-            print(f"[GRAPHRAG] response_text: string {len(_rt)} chars: '{_rt[:80]}'")
-        else:
-            print(f"[GRAPHRAG] response_text: {type(_rt).__name__}")
 
         # ── Clarification request response ──────────────────────────────────
         # GraphRAG can return a THIRD response shape: a dict with
@@ -912,37 +903,13 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
             )
             print(f"[GRAPHRAG] Needs clarification — {len(collections)} collections offered")
 
-            # Save collections to PRODUCT_SELECTION so the next message
-            # ("Outdoor LED Gate Lamp Lights", "help me order Gate Lights")
-            # is matched by _try_resolve_product_followup instead of being
-            # sent to GraphRAG as a new query and returning empty results.
-            # Each collection is stored as a synthetic product entry.
-            if collections:
-                try:
-                    synthetic_products = [
-                        {
-                            "name":            c,
-                            "sku":             "",
-                            "price_num":       0,
-                            "image_url":       "",
-                            "global_offers":   "",
-                            "_is_collection":  True,
-                            "_original_query": graphrag_text,
-                        }
-                        for c in collections
-                    ]
-                    await save_graphrag_product_selection(
-                        incoming.tenant_id, incoming.session_id, synthetic_products
-                    )
-                    print(f"[GRAPHRAG] Saved {len(collections)} collections to PRODUCT_SELECTION")
-                except Exception as _ce:
-                    print(f"[GRAPHRAG] Failed to save collections to PRODUCT_SELECTION: {_ce}")
-
-            lines = [f"Could you please specify which type you're interested in?"]
+            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
             if collections:
                 lines.append("")
-                for c in collections:
-                    lines.append(f"• {c}")
+                for i, c in enumerate(collections, 1):
+                    lines.append(f"*{i}.* {c}")
+                lines.append("")
+                lines.append("Just reply with the collection name and I'll show you the options! 💡")
 
             return "\n".join(lines)
 
@@ -997,25 +964,17 @@ async def call_graphrag_api(incoming, session_history: list = None) -> str:
                             return await _send_structured_product_list(incoming, retry_text)
                         elif isinstance(retry_text, dict) and retry_text.get("status") == "needs_clarification":
                             collections = retry_text.get("available_collections", [])
-                            if collections:
-                                try:
-                                    _syn2 = [
-                                        {"name": c, "sku": "", "price_num": 0,
-                                         "image_url": "", "global_offers": "",
-                                         "_is_collection": True, "_original_query": graphrag_text}
-                                        for c in collections
-                                    ]
-                                    await save_graphrag_product_selection(
-                                        incoming.tenant_id, incoming.session_id, _syn2
-                                    )
-                                    print(f"[GRAPHRAG] Retry: saved {len(collections)} collections to PRODUCT_SELECTION")
-                                except Exception as _ce2:
-                                    print(f"[GRAPHRAG] Retry: save failed: {_ce2}")
-                            lines = ["Could you please specify which type you're interested in?"]
+                            clarify_msg = retry_text.get(
+                                "message",
+                                "Could you let me know which category you're interested in?"
+                            )
+                            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
                             if collections:
                                 lines.append("")
-                                for c in collections:
-                                    lines.append(f"• {c}")
+                                for i, c in enumerate(collections, 1):
+                                    lines.append(f"*{i}.* {c}")
+                                lines.append("")
+                                lines.append("Just reply with the collection name and I'll show you the options! 💡")
                             return "\n".join(lines)
                         elif isinstance(retry_text, str) and len(retry_text) > 100:
                             reply_str = retry_text
@@ -1556,18 +1515,43 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             incoming.tenant_id, incoming.session_id, updated
                         )
                         print(f"[NEGOTIATOR] Showing order summary before invoice")
+                        # Build discount label and next-tier upsell for confirmation summary
+                        _auto_disc_pct  = result["state"].get("auto_offer_disc_pct", 0)
+                        _list_price     = price_num  # always the true list price
+                        _disc_label     = ""
+                        _upsell_line    = ""
+                        if _auto_disc_pct and _list_price and agreed < _list_price:
+                            _disc_label = f"• *Store offer {int(_auto_disc_pct)}% applied:* Rs.{agreed:,.0f}/unit"
+                            # Calculate next tier upsell
+                            try:
+                                from ai.negotiator import parse_global_offer_tiers, get_next_tier
+                                _go = result["state"].get("global_offers", "")
+                                if _go:
+                                    _tiers = parse_global_offer_tiers(_go)
+                                    _order_val = agreed * qty
+                                    _next_t = get_next_tier(_order_val, _tiers)
+                                    if _next_t:
+                                        _units_needed = max(1, int((_next_t[0] - _order_val) / agreed) + 1)
+                                        _upsell_line = f"\nOrder {_units_needed} more unit(s) to reach Rs.{_next_t[0]:,} and unlock {_next_t[1]}% off!"
+                            except Exception as _ue:
+                                print(f"[CONFIRM] Upsell calc failed: {_ue}")
                         lines = [
                             f"Great news, {incoming.sender_name}! Here's your order summary:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {qty} units",
-                            f"• *Price per unit:* Rs.{agreed:,.0f}",
+                            f"• *List price:* Rs.{_list_price:,.0f}/unit" if _disc_label else f"• *Price per unit:* Rs.{agreed:,.0f}",
+                        ]
+                        if _disc_label:
+                            lines.append(_disc_label)
+                        lines += [
                             f"• *Subtotal:* Rs.{sub:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.0f}",
                             f"• *Total Payable:* Rs.{total:,.0f}",
-                            "",
-                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
+                        if _upsell_line:
+                            lines.append(_upsell_line)
+                        lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
                         return "\n".join(lines)
 
                     if result["escalate"]:
@@ -1612,38 +1596,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         (name in _msg_lower and len(name) > 6)
         for name in _selection_names if name
     )
-    if _matches_selection:
-        # Check if matched item is a synthetic collection entry (_is_collection=True).
-        # If so, rewrite incoming.text to the clean collection name and return None
-        # so GraphRAG is called with that focused query instead of the full sentence.
-        # e.g. "help me to order Outdoor LED Gate Lamp Lights" -> "Outdoor LED Gate Lamp Lights"
-        for p in selection:
-            pname = (p.get("product_name") or p.get("name") or "").lower().strip()
-            if pname and (
-                _msg_lower == pname or
-                (_msg_lower in pname and len(_msg_lower) > 6) or
-                (pname in _msg_lower and len(pname) > 6)
-            ):
-                if p.get("_is_collection"):
-                    clean_name     = p.get("product_name") or p.get("name")
-                    original_query = p.get("_original_query", "")
-                    # "LED Outdoor Wall Light" alone returns empty from GraphRAG
-                    # because collection names are not valid standalone search queries.
-                    # Combine with the original query that triggered needs_clarification
-                    # so GraphRAG gets both the category context and specific type.
-                    # e.g. original="outdoor lights" + collection="LED Outdoor Wall Light"
-                    #   → query = "outdoor lights LED Outdoor Wall Light"
-                    if original_query and original_query.lower().strip() != clean_name.lower().strip():
-                        incoming.text = f"{original_query} {clean_name}"
-                        print(f"[FOLLOW-UP] Collection '{clean_name}' — combined query: '{incoming.text}'")
-                    else:
-                        incoming.text = clean_name
-                        print(f"[FOLLOW-UP] Collection selected: '{clean_name}' — routing to GraphRAG")
-                    return None
-
     if _matches_selection and parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] is_new_search overridden — message matches selection list item: '{incoming.text}'")
         parsed["is_new_search"] = False
+        # Also set selected_product_name if not already set
         if not parsed.get("selected_product_name"):
             for p in selection:
                 pname = (p.get("product_name") or p.get("name") or "").lower().strip()
