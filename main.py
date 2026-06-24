@@ -2950,9 +2950,3 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Opt
     except Exception as e:
         print(f"[WHATSAPP] Image send error: {e}")
         return None
-
-
-
-
-
-        #s
