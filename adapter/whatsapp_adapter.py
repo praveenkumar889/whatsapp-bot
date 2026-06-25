@@ -241,3 +241,69 @@ async def parse_webhook(data: dict) -> Optional[IncomingMessage]:
     except (KeyError, IndexError, TypeError) as e:
         print(f"[ADAPTER ERROR] Malformed webhook payload: {e}")
         return None
+
+
+# ── Outbound message senders ─────────────────────────────────────────────────
+async def send_whatsapp_reply(to: str, message: str) -> Optional[str]:
+    """
+    Sends a text reply to a WhatsApp user via Meta Graph API.
+    Returns the message ID (wamid) if successful, None otherwise.
+    """
+    url     = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type":    "individual",
+        "to":                to,
+        "type":              "text",
+        "text":              {"body": message},
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            print(f"[WHATSAPP] Reply sent to {to}")
+            try:
+                res_data = response.json()
+                msg_id = res_data.get("messages", [{}])[0].get("id")
+                return msg_id or "unknown_wamid"
+            except Exception:
+                return "unknown_wamid"
+        else:
+            print(f"[WHATSAPP] Error {response.status_code}: {response.text}")
+            return None
+
+
+async def send_whatsapp_image(to: str, image_url: str, caption: str = "") -> Optional[str]:
+    """
+    Sends a product image to a WhatsApp user via Meta Graph API.
+    Returns the message ID (wamid) if successful, None otherwise.
+    """
+    try:
+        url     = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type":    "individual",
+            "to":                to,
+            "type":              "image",
+            "image": {
+                "link":    image_url,
+                "caption": caption,
+            },
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            if response.status_code == 200:
+                print(f"[WHATSAPP] Image sent to {to} — {image_url[:60]}")
+                try:
+                    res_data = response.json()
+                    msg_id = res_data.get("messages", [{}])[0].get("id")
+                    return msg_id or "unknown_wamid"
+                except Exception:
+                    return "unknown_wamid"
+            else:
+                print(f"[WHATSAPP] Image failed {response.status_code}: {response.text[:100]}")
+                return None
+    except Exception as e:
+        print(f"[WHATSAPP] Image send error: {e}")
+        return None
