@@ -995,12 +995,11 @@ async def handle_negotiation(
                                   f"Rs.{next_t[0]:,} and unlock {next_t[1]}% off!")
 
                     try:
-                        # Deterministic breakdown: original → store offer → final
-                        # No LLM call — zero hallucination risk, always accurate.
-                        _disc_saving  = round((price_num - auto_price) * quantity)
-                        _gst_rate     = getattr(incoming, "gst_rate", 0.18)
-                        _gst_amt      = round(auto_total * _gst_rate, 2)
-                        _payable      = round(auto_total * (1 + _gst_rate), 2)
+                        # Deterministic breakdown — no LLM, no hallucination risk
+                        _gst_rate    = getattr(incoming, "gst_rate", 0.18)
+                        _gst_amt     = round(auto_total * _gst_rate, 2)
+                        _payable     = round(auto_total * (1 + _gst_rate), 2)
+                        _disc_saving = round((price_num - auto_price) * quantity)
                         reply = (
                             f"Here's your updated order summary, {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
@@ -1020,11 +1019,11 @@ async def handle_negotiation(
                             f"Here's your updated order summary, {sender}!\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
-                            f"• *Price per unit:* Rs.{auto_price:,.0f}\n"
+                            f"• *Regular price:* Rs.{price_num:,.0f}/unit\n"
+                            f"• *Store offer {auto_disc}% OFF:* Rs.{auto_price:,.0f}/unit\n"
                             f"• *Total:* Rs.{auto_total:,.0f}\n\n"
                             "Reply *Confirm* to place your order! 🎉"
                         )
-
                     return {
                         "reply":        reply,
                         "state":        _updated_state(
