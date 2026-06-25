@@ -597,16 +597,38 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                                                     f"Rs.{_next71[0]:,} and unlock {_next71[1]}% off!")
                         except Exception as _e71:
                             print(f"[CONFIRM] Upsell calc failed: {_e71}")
+                        # Build transparent breakdown: original → store offer → negotiated
+                        _auto_disc_pct  = result["state"].get("auto_offer_disc_pct", 0)
+                        _auto_unit      = result["state"].get("auto_offer_unit_price")
+                        _store_saving   = round((price_num - (_auto_unit or agreed)) * qty)
+                        _neg_saving     = round(((_auto_unit or agreed) - agreed) * qty) if _auto_unit else 0
+                        _total_saving   = round((price_num - agreed) * qty)
                         lines = [
-                            f"Great news, {incoming.sender_name}! Here's your order summary:",
+                            f"Here's your order summary, {incoming.sender_name}! Please review:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {qty} units",
-                            f"• *Price per unit:* Rs.{agreed:,.0f}",
+                        ]
+                        if _auto_disc_pct and _auto_unit and _auto_unit != agreed:
+                            lines += [
+                                f"• *Regular price:* Rs.{price_num:,.0f}/unit",
+                                f"• *Store offer {_auto_disc_pct}% OFF:* Rs.{_auto_unit:,.0f}/unit",
+                                f"• *Negotiated price:* Rs.{agreed:,.0f}/unit",
+                            ]
+                        elif _auto_disc_pct and _auto_unit:
+                            lines += [
+                                f"• *Regular price:* Rs.{price_num:,.0f}/unit",
+                                f"• *Store offer {_auto_disc_pct}% OFF:* Rs.{agreed:,.0f}/unit",
+                            ]
+                        else:
+                            lines.append(f"• *Price per unit:* Rs.{agreed:,.0f}")
+                        lines += [
                             f"• *Subtotal:* Rs.{sub:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.2f}",
                             f"• *Total Payable:* Rs.{total:,.2f}",
                         ]
+                        if _total_saving > 0:
+                            lines.append(f"\n🎁 *You save Rs.{_total_saving:,} on this order!*")
                         if _conf_upsell:
                             lines.append(_conf_upsell)
                         lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]

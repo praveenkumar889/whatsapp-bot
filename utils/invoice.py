@@ -225,28 +225,58 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 0.2 * cm))
 
     # ── Totals ────────────────────────────────────────────────────────────────
-    def trow(label, amount, bold=False):
+    def trow(label, amount, bold=False, color=None, prefix=""):
         fn = "Helvetica-Bold" if bold else "Helvetica"
         fs = 10 if bold else 9
+        tc = color or DARK_BLUE
         sl = ParagraphStyle("tl", fontName=fn, fontSize=fs,
-                            textColor=DARK_BLUE, alignment=TA_RIGHT, leading=fs*1.4)
+                            textColor=tc, alignment=TA_RIGHT, leading=fs*1.4)
         sv = ParagraphStyle("tv", fontName=fn, fontSize=fs,
-                            textColor=DARK_BLUE, alignment=TA_RIGHT, leading=fs*1.4)
+                            textColor=tc, alignment=TA_RIGHT, leading=fs*1.4)
+        amt_str = f"{prefix}{R}{abs(amount):,.2f}" if prefix else f"{R}{amount:,.2f}"
         return ["", "", "",
                 Paragraph(label, sl),
-                Paragraph(f"{R}{amount:,.2f}", sv)]
+                Paragraph(amt_str, sv)]
 
-    totals = Table([
+    # Build totals rows with optional discount breakdown
+    GREEN = colors.HexColor("#1a7a40")
+    store_disc_pct   = order.get("store_discount_pct", 0)
+    store_disc_amt   = order.get("store_discount_amount", 0)
+    neg_disc_amt     = order.get("negotiation_discount_amount", 0)
+    original_amt     = order.get("original_amount", 0)
+
+    total_rows = []
+    if original_amt and original_amt > total_price:
+        total_rows.append(trow("Original Amount:", original_amt))
+    if store_disc_amt and store_disc_amt > 0:
+        total_rows.append(trow(
+            f"Store Offer ({store_disc_pct}% OFF):", store_disc_amt,
+            color=GREEN, prefix="-"
+        ))
+    if neg_disc_amt and neg_disc_amt > 0:
+        total_rows.append(trow(
+            "Negotiation Discount:", neg_disc_amt,
+            color=GREEN, prefix="-"
+        ))
+    total_rows += [
         trow("Subtotal:",      total_price),
         trow("GST (18%):",     gst_amount),
         trow("TOTAL PAYABLE:", total_with_gst, bold=True),
-    ], colWidths=[cno, cprd, cqty, cunt, ctot])
+    ]
+    if store_disc_amt or neg_disc_amt:
+        _total_saved = round((store_disc_amt or 0) + (neg_disc_amt or 0), 2)
+        total_rows.append(trow(
+            f"You Saved:", _total_saved, color=GREEN
+        ))
+
+    totals = Table(total_rows, colWidths=[cno, cprd, cqty, cunt, ctot])
     totals.setStyle(TableStyle([
         ("TOPPADDING",    (0,0),(-1,-1), 4),
         ("BOTTOMPADDING", (0,0),(-1,-1), 4),
         ("RIGHTPADDING",  (3,0),(-1,-1), 8),
-        ("LINEABOVE",     (3,2),(-1,2),  1.2, DARK_BLUE),
-        ("LINEBELOW",     (3,2),(-1,2),  1.2, DARK_BLUE),
+        ("LINEABOVE",     (3,-3),(-1,-3), 1.2, DARK_BLUE),
+        ("LINEBELOW",     (3,-2),(-1,-2), 0.5, DARK_BLUE),
+        ("LINEBELOW",     (3,-1),(-1,-1), 1.2, DARK_BLUE),
     ]))
     elements.append(totals)
     elements.append(Spacer(1, 0.6 * cm))

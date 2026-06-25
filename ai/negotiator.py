@@ -995,40 +995,34 @@ async def handle_negotiation(
                                   f"Rs.{next_t[0]:,} and unlock {next_t[1]}% off!")
 
                     try:
-                        resp = _client.chat.completions.create(
-                            model=AZURE_OPENAI_DEPLOYMENT, max_tokens=250, temperature=0.3,
-                            messages=[
-                                {"role": "system", "content": (
-                                    f"You are a sales assistant for {biz_name}.\n"
-                                    f"Customer updated to {quantity} units.\n"
-                                    f"The store's {auto_disc}% offer tier is now automatically applied.\n"
-                                    f"Show a clean order summary:\n"
-                                    f"- Product: {product_name}\n"
-                                    f"- Quantity: {quantity} units\n"
-                                    f"- Our price: Rs.{price_num:,.0f}/unit (list price)\n"
-                                    f"- {auto_disc}% store offer applied: Rs.{auto_price:,.0f}/unit\n"
-                                    f"- Total: Rs.{auto_total:,.0f}\n"
-                                    f"{'Upsell: ' + upsell if upsell else ''}\n"
-                                    f"End with 'Please confirm and we'll process your order!'\n"
-                                    "IMPORTANT: If the Upsell line above is empty, do NOT invent "
-                                    "any upsell message. Do NOT mention free shipping or any other "
-                                    "benefit not explicitly listed in the Upsell line.\n"
-                                    f"Address as {sender}. Use *bold* for prices."
-                                )},
-                                {"role": "user", "content": msg},
-                            ],
-                        )
-                        reply = resp.choices[0].message.content.strip()
-                    except Exception:
+                        # Deterministic breakdown: original → store offer → final
+                        # No LLM call — zero hallucination risk, always accurate.
+                        _disc_saving  = round((price_num - auto_price) * quantity)
+                        _gst_rate     = getattr(incoming, "gst_rate", 0.18)
+                        _gst_amt      = round(auto_total * _gst_rate, 2)
+                        _payable      = round(auto_total * (1 + _gst_rate), 2)
                         reply = (
-                            f"Updated order for {sender}! 🎉\n\n"
+                            f"Here's your updated order summary, {sender}! 🎉\n\n"
                             f"• *Product:* {product_name}\n"
                             f"• *Quantity:* {quantity} units\n"
-                            f"• *List price:* Rs.{price_num:,.0f}/unit\n"
-                            f"• *{auto_disc}% store offer applied:* *Rs.{auto_price:,.0f}/unit*\n"
-                            f"• *Total: Rs.{auto_total:,.0f}*\n"
-                            + (upsell if upsell else "")
-                            + "\n\nPlease confirm and we'll process your order! 🎉"
+                            f"• *Regular price:* Rs.{price_num:,.0f}/unit (already {graphrag_discount_pct}% off original)\n"
+                            f"• *Store offer {auto_disc}% OFF automatically applied:* Rs.{auto_price:,.0f}/unit\n"
+                            f"• *Subtotal:* Rs.{auto_total:,.0f}\n"
+                            f"• *GST ({int(_gst_rate*100)}%):* Rs.{_gst_amt:,.2f}\n"
+                            f"• *Total Payable:* Rs.{_payable:,.2f}\n"
+                            + (f"\n🎁 *You save Rs.{_disc_saving:,} with the store offer!*\n" if _disc_saving > 0 else "")
+                            + (f"\n{upsell}\n" if upsell else "")
+                            + "\nReply *Confirm* to place your order and receive your invoice! 🎉"
+                        )
+                    except Exception as _sum_err:
+                        print(f"[NEGOTIATOR] Summary build failed: {_sum_err}")
+                        reply = (
+                            f"Here's your updated order summary, {sender}!\n\n"
+                            f"• *Product:* {product_name}\n"
+                            f"• *Quantity:* {quantity} units\n"
+                            f"• *Price per unit:* Rs.{auto_price:,.0f}\n"
+                            f"• *Total:* Rs.{auto_total:,.0f}\n\n"
+                            "Reply *Confirm* to place your order! 🎉"
                         )
 
                     return {

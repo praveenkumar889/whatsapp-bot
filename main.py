@@ -455,6 +455,13 @@ async def process_message(data: dict):
                         print(f"[INVOICE] Confirmation received — creating negotiated order")
                         try:
                             from db.product_store import create_order
+                            # Compute discount breakdown for invoice transparency
+                            _price_num_raw   = float(neg_state_check.get("price_num") or agreed_price)
+                            _auto_unit_price = float(neg_state_check.get("auto_offer_unit_price") or agreed_price)
+                            _auto_disc_pct   = int(neg_state_check.get("auto_offer_disc_pct") or 0)
+                            _store_disc_amt  = round((_price_num_raw - _auto_unit_price) * quantity, 2)
+                            _neg_disc_amt    = round((_auto_unit_price - agreed_price) * quantity, 2)
+                            _orig_amount     = round(_price_num_raw * quantity, 2)
                             items = [{
                                 "product_name":   product_name,
                                 "quantity_value": quantity,
@@ -469,6 +476,13 @@ async def process_message(data: dict):
                                 items       = items,
                             )
                             if new_order:
+                                # Attach discount breakdown so invoice PDF can show them
+                                if _store_disc_amt > 0:
+                                    new_order["original_amount"]            = _orig_amount
+                                    new_order["store_discount_pct"]         = _auto_disc_pct
+                                    new_order["store_discount_amount"]      = _store_disc_amt
+                                if _neg_disc_amt > 0:
+                                    new_order["negotiation_discount_amount"] = _neg_disc_amt
                                 await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                                 print(f"[INVOICE] Negotiated order created: {new_order.get('order_id')}")
                         except Exception as e:
@@ -480,19 +494,40 @@ async def process_message(data: dict):
                         updated_state = {**neg_state_check, "awaiting_invoice_confirmation": True}
                         await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated_state)
                         print(f"[INVOICE] Showing order summary — awaiting confirmation")
-                        lines = [
+                        _s_price_raw  = float(neg_state_check.get("price_num") or agreed_price)
+                        _s_auto_unit  = float(neg_state_check.get("auto_offer_unit_price") or agreed_price)
+                        _s_auto_pct   = int(neg_state_check.get("auto_offer_disc_pct") or 0)
+                        _s_store_save = round((_s_price_raw - _s_auto_unit) * quantity)
+                        _s_neg_save   = round((_s_auto_unit - agreed_price) * quantity)
+                        _s_total_save = round((_s_price_raw - agreed_price) * quantity)
+                        _s_lines = [
                             f"Here's your order summary, {incoming.sender_name}! Please review:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {quantity} units",
-                            f"• *Price per unit:* Rs.{agreed_price:,.0f}",
+                        ]
+                        if _s_auto_pct and _s_auto_unit != agreed_price:
+                            _s_lines += [
+                                f"• *Regular price:* Rs.{_s_price_raw:,.0f}/unit",
+                                f"• *Store offer {_s_auto_pct}% OFF:* Rs.{_s_auto_unit:,.0f}/unit",
+                                f"• *Negotiated price:* Rs.{agreed_price:,.0f}/unit",
+                            ]
+                        elif _s_auto_pct:
+                            _s_lines += [
+                                f"• *Regular price:* Rs.{_s_price_raw:,.0f}/unit",
+                                f"• *Store offer {_s_auto_pct}% OFF:* Rs.{agreed_price:,.0f}/unit",
+                            ]
+                        else:
+                            _s_lines.append(f"• *Price per unit:* Rs.{agreed_price:,.0f}")
+                        _s_lines += [
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.2f}",
                             f"• *Total Payable:* Rs.{total_with_gst:,.2f}",
-                            "",
-                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
-                        reply = "\n".join(lines)
+                        if _s_total_save > 0:
+                            _s_lines.append(f"\n🎁 *You save Rs.{_s_total_save:,} on this order!*")
+                        _s_lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
+                        reply = "\n".join(_s_lines)
                 else:
                     # No agreed price yet — route normally
                     reply = await call_graphrag_api(incoming, session_history)
