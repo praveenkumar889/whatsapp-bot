@@ -307,9 +307,6 @@ async def process_message(data: dict):
         if _awaiting_conf:
             # ── QTY+CONFIRM SPLIT ─────────────────────────────────────────────
             # "add 1 more unit and confirm" must update qty FIRST, then confirm.
-            # If we detect a qty change in the same message, strip the confirm
-            # intent, process the update, show the new summary, and wait for
-            # a standalone confirm on the next turn — never invoice wrong qty.
             _split_qty_done = False
             try:
                 from ai.negotiator import detect_quantity_change as _dqc
@@ -317,13 +314,8 @@ async def process_message(data: dict):
                 if _cur_qty > 0:
                     _new_qty = await _dqc(incoming.text, _cur_qty)
                     if _new_qty and _new_qty != _cur_qty:
-                        # Quantity is changing AND customer wants to confirm —
-                        # process the qty update first, show new summary, wait.
-                        print(f"[QTY+CONFIRM] Detected qty change {_cur_qty}→{_new_qty} "
-                              f"alongside confirm intent — processing qty update first")
-                        _split_state = {**_pre_neg_state,
-                                        "awaiting_invoice_confirmation": False,
-                                        "quantity": _cur_qty}  # keep old qty for negotiate
+                        print(f"[QTY+CONFIRM] qty change {_cur_qty}→{_new_qty} with confirm — processing qty first")
+                        _split_state = {**_pre_neg_state, "awaiting_invoice_confirmation": False, "quantity": _cur_qty}
                         _split_go = _pre_neg_state.get("global_offers")
                         if not _split_go:
                             try:
@@ -334,8 +326,7 @@ async def process_message(data: dict):
                             incoming              = incoming,
                             product_name          = _pre_neg_state.get("product_name", ""),
                             price_num             = float(_pre_neg_state.get("price_num", 0)),
-                            regular_price         = float(_pre_neg_state.get("regular_price")
-                                                          or _pre_neg_state.get("price_num", 0)),
+                            regular_price         = float(_pre_neg_state.get("regular_price") or _pre_neg_state.get("price_num", 0)),
                             graphrag_discount_pct = int(_pre_neg_state.get("graphrag_discount_pct") or 0),
                             session_history       = session_history,
                             negotiation_state     = _split_state,
@@ -347,17 +338,15 @@ async def process_message(data: dict):
                              "quantity": _split_result.get("quantity", _new_qty)}
                         )
                         _split_reply = _split_result.get("reply", "")
-                        # Append a confirm prompt so customer knows to confirm the new qty
                         if "Confirm" not in _split_reply and "confirm" not in _split_reply:
                             _split_reply += "\n\nReply *Confirm* to place your order and receive your invoice! 🎉"
                         sent = await send_whatsapp_reply(incoming.session_id, _split_reply)
                         if sent:
-                            await save_outbound_message(
-                                tenant_id=incoming.tenant_id, session_id=incoming.session_id,
-                                message_id=sent, text=_split_reply, region=incoming.region)
+                            await save_outbound_message(tenant_id=incoming.tenant_id,
+                                session_id=incoming.session_id, message_id=sent,
+                                text=_split_reply, region=incoming.region)
                             await update_reply(incoming.message_id, _split_reply,
                                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), None)
-                        _split_qty_done = True
                         return
             except Exception as _sqe:
                 print(f"[QTY+CONFIRM] Split check failed: {_sqe}")
@@ -403,18 +392,48 @@ async def process_message(data: dict):
                              "awaiting_invoice_confirmation": True,
                              "last_offer_price": _a, "quantity": _q}
                         )
-                        reply = "\n".join([
+                        _ng_price_raw = float(_ng_result["state"].get("price_num") or _a)
+                        _ng_auto_unit = float(_ng_result["state"].get("auto_offer_unit_price") or _a)
+                        _ng_auto_pct  = int(_ng_result["state"].get("auto_offer_disc_pct") or 0)
+                        _ng_s_save    = round((_ng_price_raw - _ng_auto_unit) * _q, 2)
+                        _ng_n_save    = round((_ng_auto_unit - _a) * _q, 2)
+                        _ng_tot_save  = round((_ng_price_raw - _a) * _q, 2)
+                        _ng_lines = [
                             f"Here's your updated order summary, {incoming.sender_name}! 🎉",
                             "",
                             f"• *Product:* {_ng_product}",
                             f"• *Quantity:* {_q} units",
-                            f"• *Price per unit:* Rs.{_a:,.0f}",
+                        ]
+                        if _ng_auto_pct and _ng_s_save > 0 and _ng_n_save > 0:
+                            _ng_lines += [
+                                f"• *Regular price:* Rs.{_ng_price_raw:,.0f}/unit",
+                                f"• *Store offer {_ng_auto_pct}% OFF:* Rs.{_ng_auto_unit:,.0f}/unit",
+                                f"• *Negotiated price:* Rs.{_a:,.0f}/unit",
+                            ]
+                        elif _ng_auto_pct and _ng_s_save > 0:
+                            _ng_lines += [
+                                f"• *Regular price:* Rs.{_ng_price_raw:,.0f}/unit",
+                                f"• *Store offer {_ng_auto_pct}% OFF:* Rs.{_a:,.0f}/unit",
+                            ]
+                        else:
+                            _ng_lines.append(f"• *Price per unit:* Rs.{_a:,.0f}")
+                        _ng_lines += [
                             f"• *Subtotal:* Rs.{_sub:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{_gst:,.2f}",
                             f"• *Total Payable:* Rs.{_tot:,.2f}",
-                            "",
-                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
-                        ])
+                        ]
+                        if _ng_tot_save > 0:
+                            if _ng_s_save > 0 and _ng_n_save > 0:
+                                _ng_lines += [
+                                    f"",
+                                    f"🎁 *Total savings: Rs.{_ng_tot_save:,.0f}*",
+                                    f"   • Store offer: Rs.{_ng_s_save:,.0f}",
+                                    f"   • Negotiation: Rs.{_ng_n_save:,.0f}",
+                                ]
+                            else:
+                                _ng_lines.append(f"\n🎁 *You save Rs.{_ng_tot_save:,.0f} on this order!*")
+                        _ng_lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
+                        reply = "\n".join(_ng_lines)
                     else:
                         reply = _ng_result["reply"]
                     await update_intent(incoming.message_id, "WORKFLOW_ACTION", 0.95)
@@ -457,11 +476,11 @@ async def process_message(data: dict):
                                 "'ok confirm', 'yes confirm', 'yes proceed', 'ok proceed', "
                                 "'ok then proceed with the order', 'proceed with the order', "
                                 "'go ahead', 'go ahead with the order', 'yes go ahead', 'sure proceed'\n"
-                                "NO — these contain quantity changes and must NOT be treated as pure confirmations:\n"
-                                "'add 1 more unit and confirm', 'add more units and proceed', "
-                                "'increase to 10 and confirm', 'make it 7 units and proceed', "
+                                "NO — contains quantity change, must NOT confirm:\n"
+                                "'add 1 more unit and confirm', 'add 3 units and proceed', "
+                                "'increase to 10 and confirm', 'make it 7 and proceed', "
                                 "'can I get cheaper', 'any more discount', 'add more units'\n"
-                                "RULE: if the message contains a quantity change (add/increase/make it N), reply NO.\n"
+                                "RULE: if message has a qty change (add/increase/make it N), reply NO.\n"
                                 "Reply ONLY 'YES' or 'NO'."
                             )},
                             {"role": "user", "content": incoming.text},
@@ -523,6 +542,13 @@ async def process_message(data: dict):
                                 "unit_price":     agreed_price,
                                 "total_price":    total_price,
                             }]
+                            # Compute discount breakdown for invoice transparency
+                            _price_num_raw   = float(neg_state_check.get("price_num") or agreed_price)
+                            _auto_unit_price = float(neg_state_check.get("auto_offer_unit_price") or agreed_price)
+                            _auto_disc_pct   = int(neg_state_check.get("auto_offer_disc_pct") or 0)
+                            _store_disc_amt  = round((_price_num_raw - _auto_unit_price) * quantity, 2)
+                            _neg_disc_amt    = round((_auto_unit_price - agreed_price) * quantity, 2)
+                            _orig_amount     = round(_price_num_raw * quantity, 2)
                             new_order = await create_order(
                                 tenant_id   = incoming.tenant_id,
                                 session_id  = incoming.session_id,
@@ -530,8 +556,17 @@ async def process_message(data: dict):
                                 items       = items,
                             )
                             if new_order:
+                                # Attach discount breakdown so invoice PDF shows full transparency
+                                if _orig_amount > total_price:
+                                    new_order["original_amount"]            = _orig_amount
+                                if _store_disc_amt > 0:
+                                    new_order["store_discount_pct"]         = _auto_disc_pct
+                                    new_order["store_discount_amount"]      = _store_disc_amt
+                                if _neg_disc_amt > 0:
+                                    new_order["negotiation_discount_amount"] = _neg_disc_amt
                                 await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
-                                print(f"[INVOICE] Negotiated order created: {new_order.get('order_id')}")
+                                print(f"[INVOICE] Order {new_order.get('order_id')} created with "
+                                      f"store_disc=Rs.{_store_disc_amt:.0f} neg_disc=Rs.{_neg_disc_amt:.0f}")
                         except Exception as e:
                             print(f"[INVOICE] Negotiated order creation failed: {e}")
                             new_order = None
@@ -541,19 +576,51 @@ async def process_message(data: dict):
                         updated_state = {**neg_state_check, "awaiting_invoice_confirmation": True}
                         await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated_state)
                         print(f"[INVOICE] Showing order summary — awaiting confirmation")
-                        lines = [
+                        # Transparent breakdown: regular → store offer → negotiated → GST
+                        _s_price_raw  = float(neg_state_check.get("price_num") or agreed_price)
+                        _s_auto_unit  = float(neg_state_check.get("auto_offer_unit_price") or agreed_price)
+                        _s_auto_pct   = int(neg_state_check.get("auto_offer_disc_pct") or 0)
+                        _s_store_save = round((_s_price_raw - _s_auto_unit) * quantity, 2)
+                        _s_neg_save   = round((_s_auto_unit - agreed_price) * quantity, 2)
+                        _s_total_save = round((_s_price_raw - agreed_price) * quantity, 2)
+                        _s_lines = [
                             f"Here's your order summary, {incoming.sender_name}! Please review:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {quantity} units",
-                            f"• *Price per unit:* Rs.{agreed_price:,.0f}",
+                        ]
+                        if _s_auto_pct and _s_store_save > 0 and _s_neg_save > 0:
+                            # Store offer + negotiation both applied
+                            _s_lines += [
+                                f"• *Regular price:* Rs.{_s_price_raw:,.0f}/unit",
+                                f"• *Store offer {_s_auto_pct}% OFF:* Rs.{_s_auto_unit:,.0f}/unit",
+                                f"• *Negotiated price:* Rs.{agreed_price:,.0f}/unit",
+                            ]
+                        elif _s_auto_pct and _s_store_save > 0:
+                            # Store offer only
+                            _s_lines += [
+                                f"• *Regular price:* Rs.{_s_price_raw:,.0f}/unit",
+                                f"• *Store offer {_s_auto_pct}% OFF:* Rs.{agreed_price:,.0f}/unit",
+                            ]
+                        else:
+                            _s_lines.append(f"• *Price per unit:* Rs.{agreed_price:,.0f}")
+                        _s_lines += [
                             f"• *Subtotal:* Rs.{total_price:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst_amount:,.2f}",
                             f"• *Total Payable:* Rs.{total_with_gst:,.2f}",
-                            "",
-                            "Reply *Confirm* to place your order and receive your invoice! 🎉",
                         ]
-                        reply = "\n".join(lines)
+                        if _s_total_save > 0:
+                            if _s_store_save > 0 and _s_neg_save > 0:
+                                _s_lines += [
+                                    f"",
+                                    f"🎁 *Total savings: Rs.{_s_total_save:,.0f}*",
+                                    f"   • Store offer: Rs.{_s_store_save:,.0f}",
+                                    f"   • Negotiation: Rs.{_s_neg_save:,.0f}",
+                                ]
+                            else:
+                                _s_lines.append(f"\n🎁 *You save Rs.{_s_total_save:,.0f} on this order!*")
+                        _s_lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
+                        reply = "\n".join(_s_lines)
                 else:
                     # No agreed price yet — route normally
                     reply = await call_graphrag_api(incoming, session_history)

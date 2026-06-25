@@ -225,6 +225,8 @@ def generate_invoice_pdf(
     elements.append(Spacer(1, 0.2 * cm))
 
     # ── Totals ────────────────────────────────────────────────────────────────
+    GREEN = colors.HexColor("#1a7a40")
+
     def trow(label, amount, bold=False, color=None, prefix=""):
         fn = "Helvetica-Bold" if bold else "Helvetica"
         fs = 10 if bold else 9
@@ -238,45 +240,40 @@ def generate_invoice_pdf(
                 Paragraph(label, sl),
                 Paragraph(amt_str, sv)]
 
-    # Build totals rows with optional discount breakdown
-    GREEN = colors.HexColor("#1a7a40")
-    store_disc_pct   = order.get("store_discount_pct", 0)
-    store_disc_amt   = order.get("store_discount_amount", 0)
-    neg_disc_amt     = order.get("negotiation_discount_amount", 0)
-    original_amt     = order.get("original_amount", 0)
+    # Pull optional discount fields (populated for negotiated / discounted orders)
+    original_amt    = float(order.get("original_amount") or 0)
+    store_disc_pct  = order.get("store_discount_pct", 0)
+    store_disc_amt  = float(order.get("store_discount_amount") or 0)
+    neg_disc_amt    = float(order.get("negotiation_discount_amount") or 0)
 
     total_rows = []
-    if original_amt and original_amt > total_price:
+    if original_amt and original_amt > total_price + 0.01:
         total_rows.append(trow("Original Amount:", original_amt))
-    if store_disc_amt and store_disc_amt > 0:
-        total_rows.append(trow(
-            f"Store Offer ({store_disc_pct}% OFF):", store_disc_amt,
-            color=GREEN, prefix="-"
-        ))
-    if neg_disc_amt and neg_disc_amt > 0:
-        total_rows.append(trow(
-            "Negotiation Discount:", neg_disc_amt,
-            color=GREEN, prefix="-"
-        ))
+    if store_disc_amt > 0:
+        label = f"Store Offer ({store_disc_pct}% OFF):" if store_disc_pct else "Store Offer:"
+        total_rows.append(trow(label, store_disc_amt, color=GREEN, prefix="-"))
+    if neg_disc_amt > 0:
+        total_rows.append(trow("Negotiation Discount:", neg_disc_amt, color=GREEN, prefix="-"))
     total_rows += [
         trow("Subtotal:",      total_price),
         trow("GST (18%):",     gst_amount),
         trow("TOTAL PAYABLE:", total_with_gst, bold=True),
     ]
-    if store_disc_amt or neg_disc_amt:
-        _total_saved = round((store_disc_amt or 0) + (neg_disc_amt or 0), 2)
-        total_rows.append(trow(
-            f"You Saved:", _total_saved, color=GREEN
-        ))
+    _total_saved = round(store_disc_amt + neg_disc_amt, 2)
+    if _total_saved > 0:
+        total_rows.append(trow("You Saved:", _total_saved, color=GREEN))
 
+    # Line positions depend on how many rows were added above
+    _subtotal_idx = len(total_rows) - (4 if _total_saved > 0 else 3)
+    _total_idx    = len(total_rows) - (2 if _total_saved > 0 else 1)
     totals = Table(total_rows, colWidths=[cno, cprd, cqty, cunt, ctot])
     totals.setStyle(TableStyle([
         ("TOPPADDING",    (0,0),(-1,-1), 4),
         ("BOTTOMPADDING", (0,0),(-1,-1), 4),
         ("RIGHTPADDING",  (3,0),(-1,-1), 8),
-        ("LINEABOVE",     (3,-3),(-1,-3), 1.2, DARK_BLUE),
-        ("LINEBELOW",     (3,-2),(-1,-2), 0.5, DARK_BLUE),
-        ("LINEBELOW",     (3,-1),(-1,-1), 1.2, DARK_BLUE),
+        ("LINEABOVE",     (3,_subtotal_idx),(-1,_subtotal_idx), 0.5, BORDER),
+        ("LINEABOVE",     (3,_total_idx),(-1,_total_idx),   1.2, DARK_BLUE),
+        ("LINEBELOW",     (3,_total_idx),(-1,_total_idx),   1.2, DARK_BLUE),
     ]))
     elements.append(totals)
     elements.append(Spacer(1, 0.6 * cm))

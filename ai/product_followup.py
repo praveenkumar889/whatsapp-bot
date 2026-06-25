@@ -597,16 +597,45 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                                                     f"Rs.{_next71[0]:,} and unlock {_next71[1]}% off!")
                         except Exception as _e71:
                             print(f"[CONFIRM] Upsell calc failed: {_e71}")
+                        _auto_disc_pct  = result["state"].get("auto_offer_disc_pct", 0)
+                        _auto_unit      = result["state"].get("auto_offer_unit_price")
+                        _s_save         = round((price_num - (_auto_unit or agreed)) * qty, 2)
+                        _n_save         = round(((_auto_unit or agreed) - agreed) * qty, 2) if _auto_unit else 0
+                        _t_save         = round((price_num - agreed) * qty, 2)
                         lines = [
-                            f"Great news, {incoming.sender_name}! Here's your order summary:",
+                            f"Here's your order summary, {incoming.sender_name}! Please review:",
                             "",
                             f"• *Product:* {product_name}",
                             f"• *Quantity:* {qty} units",
-                            f"• *Price per unit:* Rs.{agreed:,.0f}",
+                        ]
+                        if _auto_disc_pct and _auto_unit and _n_save > 0:
+                            lines += [
+                                f"• *Regular price:* Rs.{price_num:,.0f}/unit",
+                                f"• *Store offer {_auto_disc_pct}% OFF:* Rs.{_auto_unit:,.0f}/unit",
+                                f"• *Negotiated price:* Rs.{agreed:,.0f}/unit",
+                            ]
+                        elif _auto_disc_pct and _auto_unit:
+                            lines += [
+                                f"• *Regular price:* Rs.{price_num:,.0f}/unit",
+                                f"• *Store offer {_auto_disc_pct}% OFF:* Rs.{agreed:,.0f}/unit",
+                            ]
+                        else:
+                            lines.append(f"• *Price per unit:* Rs.{agreed:,.0f}")
+                        lines += [
                             f"• *Subtotal:* Rs.{sub:,.0f}",
                             f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.2f}",
                             f"• *Total Payable:* Rs.{total:,.2f}",
                         ]
+                        if _t_save > 0:
+                            if _s_save > 0 and _n_save > 0:
+                                lines += [
+                                    "",
+                                    f"🎁 *Total savings: Rs.{_t_save:,.0f}*",
+                                    f"   • Store offer: Rs.{_s_save:,.0f}",
+                                    f"   • Negotiation: Rs.{_n_save:,.0f}",
+                                ]
+                            else:
+                                lines.append(f"\n🎁 *You save Rs.{_t_save:,.0f} on this order!*")
                         if _conf_upsell:
                             lines.append(_conf_upsell)
                         lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
@@ -1199,21 +1228,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 break
 
     # ── Case 4: last_discussed_product DB fallback ───────────────────────────
-    # When all name-matching fails but customer specified a quantity, check DB
-    # for last discussed product. Covers: "i want to order 1 unit" after
-    # browsing details/comparison/installation without repeating the product name.
     if not matched_product:
         try:
-            _qty_intent = parsed.get("quantity") is not None
             _ld = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
             if _ld:
-                # Find in selection first for full product data
                 for p in selection:
                     pname = (p.get("product_name") or p.get("name") or "").lower()
                     if _ld.lower()[:12] in pname or pname[:12] in _ld.lower():
                         matched_product = p
                         break
-                # If not in selection, build minimal stub from cache
                 if not matched_product:
                     _ldc = await get_cached_product_by_name(incoming.tenant_id, _ld)
                     if _ldc:
