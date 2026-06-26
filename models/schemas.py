@@ -41,6 +41,7 @@ class IncomingMessage:
     tagline:         Optional[str] = None   # "LED Lighting Solutions | Made in India"
     city:            Optional[str] = None   # "Chennai, Tamil Nadu"
     support_email:   Optional[str] = None   # "support@inventaa.in"
+    support_phone:   Optional[str] = None   # "+91 72990 39181"
     website:         Optional[str] = None   # "inventaa.in"
     upi_id:          Optional[str] = None   # "inventaa@upi"
     account_name:    Optional[str] = None   # "Inventaa LED Innovation Pvt Ltd"

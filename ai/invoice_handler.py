@@ -223,6 +223,7 @@ async def handle_invoice_request(incoming, negotiated_order: dict = None) -> str
             tagline       = incoming.tagline,
             city          = incoming.city,
             support_email = incoming.support_email,
+            support_phone = getattr(incoming, "support_phone", None),
             website       = incoming.website,
             upi_id        = incoming.upi_id,
             account_name  = incoming.account_name,

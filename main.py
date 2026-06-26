@@ -192,6 +192,7 @@ async def process_message(data: dict):
     incoming.tagline       = tenant_info.get("tagline")
     incoming.city          = tenant_info.get("city")
     incoming.support_email = tenant_info.get("support_email")
+    incoming.support_phone = tenant_info.get("support_phone")
     incoming.website       = tenant_info.get("website")
     incoming.upi_id        = tenant_info.get("upi_id")
     incoming.account_name  = tenant_info.get("account_name")

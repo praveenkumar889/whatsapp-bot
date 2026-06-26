@@ -54,6 +54,7 @@ def generate_invoice_pdf(
     tagline:       Optional[str] = None,
     city:          Optional[str] = None,
     support_email: Optional[str] = None,
+    support_phone: Optional[str] = None,
     website:       Optional[str] = None,
     upi_id:        Optional[str] = None,
     account_name:  Optional[str] = None,
@@ -106,6 +107,8 @@ def generate_invoice_pdf(
         elements.append(Paragraph(city, s_sub))
 
     contact_parts = []
+    if support_phone:
+        contact_parts.append(f"📞 {support_phone}")
     if support_email:
         contact_parts.append(support_email)
     if website:
@@ -360,6 +363,7 @@ async def generate_and_upload_invoice(
     tagline:       Optional[str] = None,
     city:          Optional[str] = None,
     support_email: Optional[str] = None,
+    support_phone: Optional[str] = None,
     website:       Optional[str] = None,
     upi_id:        Optional[str] = None,
     account_name:  Optional[str] = None,
