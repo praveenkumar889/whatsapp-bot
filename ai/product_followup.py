@@ -441,7 +441,48 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         print(f"[FOLLOW-UP] is_comparison/recommendation/offer_inquiry — bypassing negotiation")
         neg_state = None
     elif neg_state:
-        if quick_parsed.get("is_new_search", False):
+        # ── Product-question bypass ──────────────────────────────────────
+        # An active negotiation state must NOT swallow every subsequent
+        # message about the SAME product. Questions like "is this
+        # waterproof?", "installation guide?", "what's the warranty?" are
+        # product Q&A, not negotiation — they need to reach the normal
+        # follow-up resolver (Case 2-4 below) instead of the negotiation
+        # handler. This only clears neg_state LOCALLY for this turn (does
+        # NOT call clear_negotiation_state) so the customer can still
+        # resume/confirm the negotiated price afterwards.
+        _is_product_qa = False
+        try:
+            _pqa_resp = _client.chat.completions.create(
+                model       = AZURE_OPENAI_DEPLOYMENT,
+                max_tokens  = 5,
+                temperature = 0,
+                messages    = [
+                    {"role": "system", "content": (
+                        "Is the customer asking a QUESTION about the product itself — "
+                        "e.g. warranty, installation guide/steps, dimensions, material, "
+                        "waterproofing, IP rating, color, size, delivery, or features — "
+                        "RATHER than negotiating price, confirming/proceeding with an "
+                        "order, or stating/changing a quantity?\n"
+                        "YES examples: 'is this waterproof?', 'is there an installation "
+                        "guide for this?', 'what is the warranty?', 'what size is it?', "
+                        "'is it aluminum?', 'how do I install this?', 'what colors are "
+                        "available?'\n"
+                        "NO examples: 'can I get a discount', 'I want it for 2000', "
+                        "'confirm', 'proceed', 'add 2 more units', 'I want 2 units', "
+                        "'yes', 'ok', 'can you do better on price'\n"
+                        "Reply ONLY 'YES' or 'NO'."
+                    )},
+                    {"role": "user", "content": incoming.text},
+                ],
+            )
+            _is_product_qa = "YES" in _pqa_resp.choices[0].message.content.strip().upper()
+        except Exception as _pqae:
+            print(f"[NEGOTIATOR] Product-QA bypass check failed: {_pqae}")
+
+        if _is_product_qa:
+            print(f"[NEGOTIATOR] Product question during active negotiation — bypassing for this turn (state preserved)")
+            neg_state = None
+        elif quick_parsed.get("is_new_search", False):
             print(f"[NEGOTIATOR] New search — clearing stale negotiation state")
             await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
             neg_state = None
