@@ -240,6 +240,16 @@ async def process_message(data: dict):
         print(f"[PIPELINE] Duplicate — skipping {incoming.message_id}")
         return
 
+    # ── Step 3.4: Save to DB (Save-First rule) ─────────────────────────────
+    # Inserts the message into messages table IMMEDIATELY after the duplicate
+    # check — before the lock, history fetch, or any LLM calls. This closes
+    # the race window where a Meta webhook retry for the SAME message_id
+    # (sent while the first delivery is still mid-pipeline, seconds to hours
+    # later) would pass is_duplicate() again because the row hadn't been
+    # saved yet, causing the message to be silently reprocessed and a second
+    # (or third/fourth) reply sent with no new customer message ever arriving.
+    await save_message(incoming)
+
     # ── Step 3.5: Distributed processing lock ─────────────────────────────
     # Prevents same session being processed simultaneously across workers.
     # INSERT into processing_locks table — PRIMARY KEY prevents duplicates.
@@ -259,11 +269,6 @@ async def process_message(data: dict):
             session_id = incoming.session_id,
             limit      = 10,
         )
-
-        # ── Step 5: Save to DB (Save-First rule) ──────────────────────────
-        # Inserts the message into messages table BEFORE processing.
-        # If AI call or reply fails, message is still in DB for debugging.
-        await save_message(incoming)
 
         # ── Step 6: Classify intent ────────────────────────────────────────
         # Sends customer message + session history to Azure OpenAI GPT-4.1.

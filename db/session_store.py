@@ -631,6 +631,7 @@ async def get_cached_product_by_name(
 
         name_lower = product_name.lower().strip()
 
+        # Pass 1: exact match (fast path, most common case)
         for row in result.data:
             raw = row.get("api_response")
             data = _json.loads(raw) if isinstance(raw, str) else raw
@@ -640,6 +641,22 @@ async def get_cached_product_by_name(
                 cached_name = (item.get("product_name") or "").lower().strip()
                 if cached_name == name_lower:
                     print(f"[DB] Product found in cache by name - '{product_name}' -> SKU={item.get('sku')}")
+                    return item
+
+        # Pass 2: fuzzy substring match fallback — catches minor formatting
+        # differences (whitespace, truncation) between how a name was saved
+        # as "last discussed product" vs. how it's stored in product_cache.
+        # Mirrors the substring-matching pattern used elsewhere in the codebase
+        # (e.g. product_followup.py) instead of requiring a brittle exact match.
+        for row in result.data:
+            raw = row.get("api_response")
+            data = _json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(data, list):
+                data = [data]
+            for item in data:
+                cached_name = (item.get("product_name") or "").lower().strip()
+                if cached_name and (name_lower in cached_name or cached_name in name_lower):
+                    print(f"[DB] Product found in cache by fuzzy name match - '{product_name}' ~ '{cached_name}' -> SKU={item.get('sku')}")
                     return item
 
         return None

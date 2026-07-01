@@ -258,11 +258,19 @@ FORMAT RULES — CRITICAL:
 - Use this exact structure for each product:
 
 *1. [Product Name]*
-  • Price: Rs.X,XXX (Y% off Rs.Z,ZZZ)
+  • Price: Rs.[list_price] (if discount_pct > 0, add: (Y% off Rs.[regular_price]) using the real discount_pct value for Y)
   • [Key feature 1]
   • [Key feature 2]
   • [Key feature 3]
   • Best for: [use case]
+
+PRICE RULE — CRITICAL:
+- [list_price], [regular_price], and [discount_pct] are placeholders — you MUST replace them with
+  the actual numeric values from that product's entry in PRODUCTS TO COMPARE below.
+- NEVER output the literal characters "X,XXX", "Y", or "Z,ZZZ" — those do not exist in the data.
+  If you see them in this prompt, they are only illustrating the STRUCTURE, not real values.
+- If discount_pct is 0 or missing, just show "Price: Rs.[list_price]" with no discount clause.
+- Do NOT invent any numbers — use only what is provided in PRODUCTS TO COMPARE.
 
 RULES:
 - Address the customer as {incoming.sender_name}

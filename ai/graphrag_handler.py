@@ -85,6 +85,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
                     "warranty":                   p.get("warranty", ""),
                     "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
                     "feature_descriptions":       p.get("feature_descriptions", ""),
+                    "global_offers":              p.get("global_offers", ""),
                 }]
                 batch_items.append({"sku": sku, "api_response": cached_item})
 
